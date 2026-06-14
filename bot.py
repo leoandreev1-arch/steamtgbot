@@ -34,9 +34,7 @@ def get_steam_data(appid):
                 continue
             g = data[str(appid)]["data"]
 
-            # Проверка демо
             is_demo = g.get("is_demo", False) or g.get("type", "") == "demo"
-
             name = g.get("name", "Без названия")
             price_info = g.get("price_overview")
             if is_demo:
@@ -67,7 +65,8 @@ def get_steam_data(appid):
             continue
     return None
 
-def format_table():
+# ==== ПОЛНАЯ ТАБЛИЦА (карточки) ====
+def format_full_table():
     if not games:
         return "Таблица пока пуста. Киньте ссылку на игру Steam."
 
@@ -88,8 +87,30 @@ def format_table():
 
     header = f"<b>📊 Игры в списке ({len(games)} шт.)</b>\n"
     separator = "\n" + "—" * 25 + "\n"
-    return header + separator.join(blocks)
+    footer = "\n\nКороткая версия: /short"
+    return header + separator.join(blocks) + footer
 
+# ==== КОРОТКАЯ ТАБЛИЦА (только название и цена) ====
+def format_short_table():
+    if not games:
+        return "Таблица пока пуста. Киньте ссылку на игру Steam."
+
+    sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
+    lines = ["<b>📋 Краткий список</b>\n<pre>"]
+    lines.append(f"{'Название':<30} {'Цена':<15}")
+    lines.append("-" * 45)
+
+    for appid, row in sorted_games:
+        name = row.get("Название", "?")[:29]
+        price = row.get("Цена", "?")[:14]
+        lines.append(f"{name:<30} {price:<15}")
+
+    lines.append("</pre>")
+    lines.append(f"Всего игр: {len(games)}")
+    lines.append("Полная версия: /table")
+    return "\n".join(lines)
+
+# ==== ОБРАБОТЧИКИ ====
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     pattern = r"https?://store\.steampowered\.com/app/(\d+)"
@@ -126,8 +147,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
 
-async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    table = format_table()
+async def full_table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    table = format_full_table()
+    await update.message.reply_text(table, parse_mode="HTML")
+
+async def short_table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    table = format_short_table()
     await update.message.reply_text(table, parse_mode="HTML")
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -165,8 +190,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    app.add_handler(CommandHandler("table", table_command))
-    app.add_handler(CommandHandler("t", table_command))
+    app.add_handler(CommandHandler("table", full_table_command))
+    app.add_handler(CommandHandler("t", full_table_command))
+    app.add_handler(CommandHandler("short", short_table_command))
+    app.add_handler(CommandHandler("s", short_table_command))
     app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(MessageHandler(filters.Document.FileExtension("json"), handle_document))
