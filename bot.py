@@ -7,7 +7,6 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["TOKEN"]
 DATA_FILE = "games.json"
 
-# Загружаем сохранённую таблицу при старте
 def load_games():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -21,10 +20,11 @@ def save_games(games):
 games = load_games()
 
 def get_steam_data(appid):
+    # Порядок: пытаемся всё лучшее на русском
     for region, lang, currency_label in [
-        ("ru", "russian", "₽"),
-        ("ru", "english", "₽"),
-        ("us", "english", "USD")
+        ("ru", "russian", "₽"),      # Россия + русский
+        ("us", "russian", "USD"),    # США, но русский язык (если есть)
+        ("us", "english", "USD")     # США + английский (последний шанс)
     ]:
         try:
             url = f"https://store.steampowered.com/api/appdetails?appids={appid}&cc={region}&l={lang}"
@@ -41,14 +41,18 @@ def get_steam_data(appid):
                 if currency_label == "₽":
                     price = f"{amount:.2f} ₽"
                 else:
-                    price = f"{amount:.2f} USD (недоступна в РФ)"
+                    price = f"{amount:.2f} USD" + (" (недоступна в РФ)" if region == "us" else "")
             else:
                 price = "Бесплатно" if g.get("is_free") else "Нет цены"
+
             genres_list = [x["description"] for x in g.get("genres", [])]
             genres = ", ".join(genres_list) if genres_list else "Не указаны"
             description = g.get("short_description", "—")
-            if lang == "english" and region == "ru":
+
+            # Пометка, если язык не русский
+            if lang != "russian":
                 description += " (описание на английском)"
+
             return {
                 "name": name,
                 "price": price,
@@ -124,7 +128,6 @@ async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(table, parse_mode="HTML")
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет файл games.json для резервного копирования"""
     if not os.path.exists(DATA_FILE):
         await update.message.reply_text("Нет данных для резервного копирования.")
         return
@@ -132,15 +135,13 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=f,
             filename="games_backup.json",
-            caption="Резервная копия таблицы. При необходимости отправь этот файл боту, и он восстановит данные."
+            caption="Резервная копия таблицы."
         )
 
 async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Восстановление из присланного файла (ожидает документ)"""
-    await update.message.reply_text("Отправь мне файл games_backup.json, и я восстановлю таблицу.")
+    await update.message.reply_text("Отправь мне файл games_backup.json для восстановления.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает полученный документ для восстановления"""
     doc = update.message.document
     if not doc.file_name.endswith(".json"):
         return
