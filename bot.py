@@ -18,51 +18,52 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Конфигурация
 TOKEN = os.environ["TOKEN"]
-STORAGE_CHAT_ID = int(os.environ["STORAGE_CHAT_ID"])
+GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # ID группы
 
-games: dict[str, dict] = {}
-storage_msg_id: int | None = None
+games: dict[str, dict] = {}          # все игры
+pinned_msg_id: int | None = None     # ID закреплённого сообщения
 
 
-# ── Работа с хранилищем ──────────────────────────────────────
-async def restore_from_storage(app: Application) -> None:
-    global games, storage_msg_id
+# ── Восстановление из закрепа при старте ────────────────────
+async def restore_from_pinned(app: Application) -> None:
+    global games, pinned_msg_id
     try:
-        async for msg in app.bot.get_chat_history(chat_id=STORAGE_CHAT_ID, limit=1):
-            if msg.text:
-                games = json.loads(msg.text)
-                storage_msg_id = msg.message_id
-                logger.info("Восстановлено %d игр из хранилища", len(games))
-            else:
-                logger.warning("Последнее сообщение в хранилище не содержит текста")
+        chat = await app.bot.get_chat(chat_id=GROUP_CHAT_ID)
+        if chat.pinned_message and chat.pinned_message.text:
+            games = json.loads(chat.pinned_message.text)
+            pinned_msg_id = chat.pinned_message.message_id
+            logger.info("Восстановлено %d игр из закрепа", len(games))
+        else:
+            logger.info("Закреплённое сообщение не найдено")
     except Exception as exc:
-        logger.warning("Не удалось восстановить данные: %s", exc)
+        logger.warning("Ошибка восстановления: %s", exc)
 
 
-async def save_to_storage(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global storage_msg_id
+# ── Сохранение в закреп ─────────────────────────────────────
+async def save_to_pinned(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global pinned_msg_id
     text = json.dumps(games, ensure_ascii=False)
     try:
-        if storage_msg_id:
+        if pinned_msg_id:
             await context.bot.edit_message_text(
-                chat_id=STORAGE_CHAT_ID, message_id=storage_msg_id, text=text
+                chat_id=GROUP_CHAT_ID,
+                message_id=pinned_msg_id,
+                text=text,
             )
         else:
-            msg = await context.bot.send_message(chat_id=STORAGE_CHAT_ID, text=text)
-            storage_msg_id = msg.message_id
+            msg = await context.bot.send_message(
+                chat_id=GROUP_CHAT_ID,
+                text=text,
+            )
+            await msg.pin()
+            pinned_msg_id = msg.message_id
     except Exception as exc:
-        logger.error("Ошибка сохранения: %s", exc)
+        logger.error("Ошибка сохранения закрепа: %s", exc)
 
 
 # ── Steam API ─────────────────────────────────────────────────
 def get_steam_data(appid: str) -> dict | None:
-    """
-    Пытается получить данные об игре через Steam Store API,
-    перебирая комбинации региона и языка.
-    Возвращает словарь с ключами name, price, genres, link или None.
-    """
     for region, lang, currency_label in [
         ("ru", "russian", "₽"),
         ("us", "russian", "USD"),
@@ -103,30 +104,32 @@ def get_steam_data(appid: str) -> dict | None:
                 "link": f"https://store.steampowered.com/app/{appid}/",
             }
         except Exception:
-            logger.debug("Ошибка при запросе %s (region=%s, lang=%s)", appid, region, lang)
+            logger.debug("Ошибка Steam API: %s", appid)
             continue
     return None
 
 
-# ── Таблица ───────────────────────────────────────────────────
+# ── Короткая таблица ─────────────────────────────────────────
 def build_short_table() -> str:
     if not games:
         return "📋 Список пока пуст."
 
-    # Сортируем по дате добавления (самые свежие сверху)
-    sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата", ""), reverse=True)
+    sorted_games = sorted(
+        games.items(),
+        key=lambda x: x[1].get("Дата", ""),
+        reverse=True,
+    )
     lines = ["<b>📋 Сравнение игр</b>\n"]
     for appid, row in sorted_games:
         name = html.escape(row.get("Название", "?"))
         price = html.escape(row.get("Цена", "?"))
         link = row.get("Ссылка", f"https://store.steampowered.com/app/{appid}/")
         lines.append(f'• <a href="{link}">{name}</a> — {price}')
-
     lines.append(f"\nВсего игр: {len(games)}")
     return "\n".join(lines)
 
 
-# ── Обработчики ───────────────────────────────────────────────
+# ── Обработчики сообщений ────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
     appids = set(re.findall(r"https?://store\.steampowered\.com/app/(\d+)", text))
@@ -149,7 +152,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         new_games += 1
 
     if new_games:
-        await save_to_storage(context)
+        await save_to_pinned(context)
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
             f"Посмотреть: /show"
@@ -164,9 +167,9 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-# ── Точка входа ───────────────────────────────────────────────
+# ── Запуск ────────────────────────────────────────────────────
 def main() -> None:
-    app = Application.builder().token(TOKEN).post_init(restore_from_storage).build()
+    app = Application.builder().token(TOKEN).post_init(restore_from_pinned).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("show", show_table))
