@@ -5,8 +5,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["TOKEN"]
-DATA_FILE = "games.json"          # локальный файл (на случай, если сообщение недоступно)
-PIN_MSG_KEY = "pinned_chat_id"    # ключ в games.json для хранения id чата и сообщения
+DATA_FILE = "games.json"
+PIN_MSG_KEY = "pinned_chat_id"
 
 def load_games():
     if os.path.exists(DATA_FILE):
@@ -63,7 +63,6 @@ def get_steam_data(appid):
             continue
     return None
 
-# ==== ТЕКСТ ТАБЛИЦЫ ДЛЯ ЗАКРЕПА (полная) ====
 def build_pin_text():
     if not games:
         return "📊 Таблица пока пуста. Добавьте ссылку на игру Steam."
@@ -88,7 +87,6 @@ def build_pin_text():
     return header + separator.join(blocks) + footer
 
 async def update_pin(context: ContextTypes.DEFAULT_TYPE):
-    """Обновляет закреплённое сообщение в чате, где бот активен."""
     chat_id = games.get(PIN_MSG_KEY, {}).get("chat_id")
     msg_id = games.get(PIN_MSG_KEY, {}).get("msg_id")
     text = build_pin_text()
@@ -104,8 +102,6 @@ async def update_pin(context: ContextTypes.DEFAULT_TYPE):
             return
         except Exception as e:
             logging.warning(f"Не удалось отредактировать закреп: {e}")
-
-    # Если закрепа нет — пробуем создать новое в том же чате
     if chat_id:
         try:
             msg = await context.bot.send_message(
@@ -120,9 +116,9 @@ async def update_pin(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Ошибка создания закрепа: {e}")
 
-# ==== ВОССТАНОВЛЕНИЕ ИЗ ЗАКРЕПА ПРИ СТАРТЕ ====
-async def restore_from_pin(app):
-    """При старте пытается прочитать закреплённое сообщение и восстановить игры."""
+async def restore_from_pin(app: Application):
+    """Восстановление из закреплённого сообщения при старте."""
+    global games
     chat_id = games.get(PIN_MSG_KEY, {}).get("chat_id")
     msg_id = games.get(PIN_MSG_KEY, {}).get("msg_id")
     if not chat_id or not msg_id:
@@ -132,14 +128,10 @@ async def restore_from_pin(app):
         text = msg.text or msg.caption
         if not text:
             return
-        # Парсим текст обратно в словарь games (упрощённо: ищем ссылки steam)
-        # Так как в тексте есть ссылки вида href="...app/ID/", мы можем вытащить appid
-        new_games = {}
         pattern = r'href="https?://store\.steampowered\.com/app/(\d+)/"'
+        new_games = {}
         for match in re.finditer(pattern, text):
             appid = match.group(1)
-            # Данные из текста вытаскивать сложно, проще заново запросить Steam
-            # Но мы можем сохранить только appid и ссылки, а остальное обновится при следующем добавлении
             new_games[appid] = {
                 "Дата обновления": "восстановлено",
                 "Название": "? (обновите ссылку)",
@@ -149,17 +141,14 @@ async def restore_from_pin(app):
                 "Ссылка": f"https://store.steampowered.com/app/{appid}/"
             }
         if new_games:
-            global games
             games.update(new_games)
             save_games(games)
             logging.info(f"Восстановлено {len(new_games)} игр из закрепа")
     except Exception as e:
         logging.warning(f"Не удалось восстановить из закрепа: {e}")
 
-# ==== КОМАНДЫ ====
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
-    # Запоминаем чат для закрепа
     chat_id = update.effective_chat.id
     pattern = r"https?://store\.steampowered\.com/app/(\d+)"
     appids = re.findall(pattern, text)
@@ -198,13 +187,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
 
-    # Обновляем закреп
     await update_pin(context)
 
 async def full_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = build_pin_text()
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
-    # Обновим закреп на всякий случай
     if PIN_MSG_KEY not in games:
         games[PIN_MSG_KEY] = {"chat_id": update.effective_chat.id}
         save_games(games)
@@ -227,14 +214,10 @@ async def short_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not os.path.exists(DATA_FILE):
-        await update.message.reply_text("Нет данных для резервного копирования.")
+        await update.message.reply_text("Нет данных.")
         return
     with open(DATA_FILE, "rb") as f:
-        await update.message.reply_document(
-            document=f,
-            filename="games_backup.json",
-            caption="Резервная копия."
-        )
+        await update.message.reply_document(document=f, filename="games_backup.json", caption="Резервная копия")
 
 async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отправь мне файл games_backup.json для восстановления.")
@@ -253,12 +236,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_games(games)
             await update.message.reply_text(f"✅ Таблица восстановлена! Игр: {len(games)-1}")
         else:
-            await update.message.reply_text("❌ Неверный формат файла.")
+            await update.message.reply_text("❌ Неверный формат.")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 def main():
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(restore_from_pin).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
     app.add_handler(CommandHandler("table", full_table))
     app.add_handler(CommandHandler("t", full_table))
@@ -267,11 +250,6 @@ def main():
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("restore", restore))
     app.add_handler(MessageHandler(filters.Document.FileExtension("json"), handle_document))
-
-    # Восстановление из закрепа при старте
-    import asyncio
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(restore_from_pin(app))
 
     webhook_url = os.environ.get("WEBHOOK_URL")
     if webhook_url:
