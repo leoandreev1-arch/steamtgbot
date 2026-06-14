@@ -20,41 +20,65 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
 STORAGE_CHAT_ID = int(os.environ["STORAGE_CHAT_ID"])
+API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 games: dict[str, dict] = {}
-storage_msg_id: int | None = None   # ID последнего сообщения (будем перезаписывать)
+storage_msg_id: int | None = None
 
 
+# ── Восстановление через HTTP-запрос к Telegram API ─────────
 async def restore_from_storage(app: Application) -> None:
-    """Восстанавливает таблицу из последнего сообщения в канале."""
     global games, storage_msg_id
     try:
-        async for msg in app.bot.get_chat_history(chat_id=STORAGE_CHAT_ID, limit=1):
-            if msg.text:
-                games = json.loads(msg.text)
-                storage_msg_id = msg.message_id
+        # Получаем последнее сообщение из канала через прямой запрос к API
+        resp = requests.get(
+            f"{API_URL}/getChatHistory",
+            params={
+                "chat_id": STORAGE_CHAT_ID,
+                "limit": 1,
+            },
+            timeout=10,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            logger.warning("Ошибка API: %s", data)
+            return
+
+        messages = data["result"]["messages"]
+        if messages:
+            msg = messages[0]
+            if "text" in msg:
+                games = json.loads(msg["text"])
+                storage_msg_id = msg["message_id"]
                 logger.info("Восстановлено %d игр из хранилища", len(games))
             else:
-                logger.warning("Сообщение в хранилище есть, но без текста")
+                logger.warning("Последнее сообщение не содержит текста")
+        else:
+            logger.info("Хранилище пусто")
     except Exception as exc:
-        logger.warning("Не удалось восстановить данные: %s", exc)
+        logger.warning("Не удалось восстановить: %s", exc)
 
 
 async def save_to_storage(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Всегда отправляет НОВОЕ сообщение с актуальными данными.
-    Старое НЕ редактируем – так надёжнее.
-    """
     global storage_msg_id
     text = json.dumps(games, ensure_ascii=False)
     try:
-        msg = await context.bot.send_message(
-            chat_id=STORAGE_CHAT_ID,
-            text=text,
+        # Всегда отправляем новое сообщение (проще и надёжнее)
+        resp = requests.post(
+            f"{API_URL}/sendMessage",
+            json={
+                "chat_id": STORAGE_CHAT_ID,
+                "text": text,
+            },
+            timeout=10,
         )
-        storage_msg_id = msg.message_id   # запоминаем новое
+        data = resp.json()
+        if data.get("ok"):
+            storage_msg_id = data["result"]["message_id"]
+        else:
+            logger.error("Ошибка отправки: %s", data)
     except Exception as exc:
-        logger.error("Ошибка сохранения в хранилище: %s", exc)
+        logger.error("Ошибка сохранения: %s", exc)
 
 
 # ── Steam API ─────────────────────────────────────────────────
