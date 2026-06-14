@@ -22,11 +22,11 @@ TOKEN = os.environ["TOKEN"]
 STORAGE_CHAT_ID = int(os.environ["STORAGE_CHAT_ID"])
 
 games: dict[str, dict] = {}
-storage_msg_id: int | None = None
+storage_msg_id: int | None = None   # ID последнего сообщения (будем перезаписывать)
 
 
 async def restore_from_storage(app: Application) -> None:
-    """Восстанавливает таблицу из канала-хранилища."""
+    """Восстанавливает таблицу из последнего сообщения в канале."""
     global games, storage_msg_id
     try:
         async for msg in app.bot.get_chat_history(chat_id=STORAGE_CHAT_ID, limit=1):
@@ -35,30 +35,26 @@ async def restore_from_storage(app: Application) -> None:
                 storage_msg_id = msg.message_id
                 logger.info("Восстановлено %d игр из хранилища", len(games))
             else:
-                logger.warning("Нет текста в последнем сообщении хранилища")
+                logger.warning("Сообщение в хранилище есть, но без текста")
     except Exception as exc:
-        logger.warning("Не удалось восстановить: %s", exc)
+        logger.warning("Не удалось восстановить данные: %s", exc)
 
 
 async def save_to_storage(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Сохраняет таблицу в канал-хранилище (редактирует или создаёт новое)."""
+    """
+    Всегда отправляет НОВОЕ сообщение с актуальными данными.
+    Старое НЕ редактируем – так надёжнее.
+    """
     global storage_msg_id
     text = json.dumps(games, ensure_ascii=False)
     try:
-        if storage_msg_id:
-            await context.bot.edit_message_text(
-                chat_id=STORAGE_CHAT_ID,
-                message_id=storage_msg_id,
-                text=text,
-            )
-        else:
-            msg = await context.bot.send_message(
-                chat_id=STORAGE_CHAT_ID,
-                text=text,
-            )
-            storage_msg_id = msg.message_id
+        msg = await context.bot.send_message(
+            chat_id=STORAGE_CHAT_ID,
+            text=text,
+        )
+        storage_msg_id = msg.message_id   # запоминаем новое
     except Exception as exc:
-        logger.error("Ошибка сохранения: %s", exc)
+        logger.error("Ошибка сохранения в хранилище: %s", exc)
 
 
 # ── Steam API ─────────────────────────────────────────────────
