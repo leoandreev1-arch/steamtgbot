@@ -6,7 +6,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["TOKEN"]
 
-# Хранилище игр в памяти: {appid: {данные}}
+# Хранилище игр в памяти (после перезапуска очищается)
 games = {}
 
 def get_steam_data(appid):
@@ -20,15 +20,18 @@ def get_steam_data(appid):
         g = data[str(appid)]["data"]
         name = g.get("name", "Без названия")
 
+        # Цена
         price_info = g.get("price_overview")
         if price_info:
             price = f"{price_info['final']/100:.2f} ₽"
         else:
             price = "Бесплатно" if g.get("is_free") else "Нет цены"
 
+        # Жанры
         genres_list = [x["description"] for x in g.get("genres", [])]
         genres = ", ".join(genres_list) if genres_list else "Не указаны"
 
+        # Описание (короткое из Steam)
         description = g.get("short_description", "—")
 
         return {
@@ -45,24 +48,31 @@ def format_table():
     if not games:
         return "Таблица пока пуста. Киньте ссылку на игру Steam."
 
+    # Сортируем по дате обновления (сначала новые)
     sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
-    table = "<b>📊 Сравнительная таблица игр</b>\n\n<pre>"
-    table += f"{'Название':<15} {'Цена':<8} {'Жанры':<18} {'Описание':<45}\n"
-    table += "-" * 86 + "\n"
 
+    blocks = []
     for appid, row in sorted_games:
-        name = row.get("Название", "?")[:14]
-        price = row.get("Цена (RUB)", "?")[:7]
-        genres = row.get("Жанры", "?")[:17]
-        desc = row.get("Описание", "—")[:44]
-        table += f"{name:<15} {price:<8} {genres:<18} {desc:<45}\n"
+        name = row.get("Название", "?")
+        price = row.get("Цена (RUB)", "?")
+        genres = row.get("Жанры", "?")
+        desc = row.get("Описание", "—")  # описание целиком, без обрезки
 
-    table += "</pre>"
-    table += f"\nВсего игр: <b>{len(games)}</b>"
-    return table
+        block = (
+            f"🎮 <b>{name}</b>\n"
+            f"💰 Цена: {price}\n"
+            f"🏷 Жанры: {genres}\n"
+            f"📝 <i>{desc}</i>"
+        )
+        blocks.append(block)
+
+    header = f"<b>📊 Игры в списке ({len(games)} шт.)</b>\n"
+    separator = "\n" + "—" * 25 + "\n"
+    return header + separator.join(blocks)
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
+    # Ищем ссылки на Steam
     pattern = r"https?://store\.steampowered\.com/app/(\d+)"
     appids = re.findall(pattern, text)
     if not appids:
@@ -71,7 +81,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for appid in set(appids):
         info = get_steam_data(appid)
         if not info:
-            await update.message.reply_text(f"❌ Не удалось получить данные для {appid}")
+            await update.message.reply_text(f"❌ Не удалось получить данные для приложения {appid}")
             continue
 
         row = {
@@ -89,10 +99,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎮 <b>{info['name']}</b>\n"
             f"💰 Цена: {info['price']}\n"
             f"🏷 Жанры: {info['genres']}\n"
-            f"📝 Описание: {info['description']}\n"
+            f"📝 {info['description']}\n"
             f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>\n\n"
             f"<i>Таблица обновлена. Всего игр: {len(games)}</i>\n"
-            f"Показать таблицу: /table"
+            f"Показать список: /table"
         )
         await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
 
