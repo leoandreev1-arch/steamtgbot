@@ -19,47 +19,51 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
-GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # ID группы
 
-games: dict[str, dict] = {}          # все игры
-pinned_msg_id: int | None = None     # ID закреплённого сообщения
+games: dict[str, dict] = {}
+storage_msg_id: int | None = None
+bot_self_chat_id: int | None = None   # ID личного чата с ботом
 
 
-# ── Восстановление из закрепа при старте ────────────────────
-async def restore_from_pinned(app: Application) -> None:
-    global games, pinned_msg_id
+# ── Восстановление из личного чата при старте ────────────────
+async def restore_from_saved(app: Application) -> None:
+    global games, storage_msg_id, bot_self_chat_id
+    me = await app.bot.get_me()
+    bot_self_chat_id = me.id   # положительный user_id
     try:
-        chat = await app.bot.get_chat(chat_id=GROUP_CHAT_ID)
-        if chat.pinned_message and chat.pinned_message.text:
-            games = json.loads(chat.pinned_message.text)
-            pinned_msg_id = chat.pinned_message.message_id
-            logger.info("Восстановлено %d игр из закрепа", len(games))
-        else:
-            logger.info("Закреплённое сообщение не найдено")
+        # Получаем последнее сообщение в чате с самим собой
+        async for msg in app.bot.get_chat_history(chat_id=bot_self_chat_id, limit=1):
+            if msg.text:
+                games = json.loads(msg.text)
+                storage_msg_id = msg.message_id
+                logger.info("Восстановлено %d игр из личного чата", len(games))
+            else:
+                logger.warning("В личном чате нет текстового сообщения")
     except Exception as exc:
-        logger.warning("Ошибка восстановления: %s", exc)
+        logger.warning("Не удалось восстановить: %s", exc)
 
 
-# ── Сохранение в закреп ─────────────────────────────────────
-async def save_to_pinned(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global pinned_msg_id
+# ── Сохранение в личный чат ──────────────────────────────────
+async def save_to_saved(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global storage_msg_id, bot_self_chat_id
+    if bot_self_chat_id is None:
+        return
     text = json.dumps(games, ensure_ascii=False)
     try:
-        if pinned_msg_id:
+        if storage_msg_id:
             await context.bot.edit_message_text(
-                chat_id=GROUP_CHAT_ID,
-                message_id=pinned_msg_id,
+                chat_id=bot_self_chat_id,
+                message_id=storage_msg_id,
                 text=text,
             )
         else:
             msg = await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
+                chat_id=bot_self_chat_id,
                 text=text,
             )
-            await msg.pin()
-            pinned_msg_id = msg.message_id
+            storage_msg_id = msg.message_id
     except Exception as exc:
-        logger.error("Ошибка сохранения закрепа: %s", exc)
+        logger.error("Ошибка сохранения: %s", exc)
 
 
 # ── Steam API ─────────────────────────────────────────────────
@@ -129,7 +133,7 @@ def build_short_table() -> str:
     return "\n".join(lines)
 
 
-# ── Обработчики сообщений ────────────────────────────────────
+# ── Обработчики ──────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
     appids = set(re.findall(r"https?://store\.steampowered\.com/app/(\d+)", text))
@@ -152,7 +156,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         new_games += 1
 
     if new_games:
-        await save_to_pinned(context)
+        await save_to_saved(context)
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
             f"Посмотреть: /show"
@@ -167,9 +171,9 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-# ── Запуск ────────────────────────────────────────────────────
+# ── Точка входа ──────────────────────────────────────────────
 def main() -> None:
-    app = Application.builder().token(TOKEN).post_init(restore_from_pinned).build()
+    app = Application.builder().token(TOKEN).post_init(restore_from_saved).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("show", show_table))
