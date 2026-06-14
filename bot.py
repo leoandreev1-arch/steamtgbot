@@ -63,6 +63,7 @@ def get_steam_data(appid):
             continue
     return None
 
+# ==== Текст таблицы для закрепа и команд ====
 def build_pin_text():
     game_items = {k: v for k, v in games.items() if k != PIN_MSG_KEY}
     if not game_items:
@@ -90,6 +91,7 @@ def build_pin_text():
     return header + separator.join(blocks) + footer
 
 async def update_pin(context: ContextTypes.DEFAULT_TYPE):
+    """Обновляет закреплённое сообщение, вызывается только при добавлении игры."""
     chat_id = games.get(PIN_MSG_KEY, {}).get("chat_id")
     msg_id = games.get(PIN_MSG_KEY, {}).get("msg_id")
     text = build_pin_text()
@@ -120,6 +122,7 @@ async def update_pin(context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Ошибка создания закрепа: {e}")
 
 async def restore_from_pin(app: Application):
+    """Восстанавливает игры из закреплённого сообщения при старте."""
     global games
     chat_id = games.get(PIN_MSG_KEY, {}).get("chat_id")
     msg_id = games.get(PIN_MSG_KEY, {}).get("msg_id")
@@ -149,6 +152,7 @@ async def restore_from_pin(app: Application):
     except Exception as e:
         logging.warning(f"Не удалось восстановить из закрепа: {e}")
 
+# ==== Обработчики команд ====
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     chat_id = update.effective_chat.id
@@ -178,9 +182,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             games[PIN_MSG_KEY]["chat_id"] = chat_id
         save_games(games)
 
+    # Обновляем закреп
     await update_pin(context)
 
-    # Короткий ответ вместо длинной карточки
     game_count = len([k for k in games if k != PIN_MSG_KEY])
     await update.message.reply_text(
         f"✅ Игра добавлена. Всего игр: {game_count}\n"
@@ -188,12 +192,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def full_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просто показывает полную таблицу, без изменения закрепа."""
     text = build_pin_text()
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
-    if PIN_MSG_KEY not in games:
-        games[PIN_MSG_KEY] = {"chat_id": update.effective_chat.id}
-        save_games(games)
-    await update_pin(context)
 
 async def short_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game_items = {k: v for k, v in games.items() if k != PIN_MSG_KEY}
@@ -218,7 +219,7 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(DATA_FILE, "rb") as f:
         await update.message.reply_document(document=f, filename="games_backup.json", caption="Резервная копия")
 
-async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отправь мне файл games_backup.json для восстановления.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,15 +244,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).post_init(restore_from_pin).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    # Основные команды
     app.add_handler(CommandHandler("full", full_table))
     app.add_handler(CommandHandler("f", full_table))
     app.add_handler(CommandHandler("short", short_table))
     app.add_handler(CommandHandler("s", short_table))
-    # оставим и старые команды, чтобы не путать
+    # Для совместимости оставим старые названия
     app.add_handler(CommandHandler("table", full_table))
     app.add_handler(CommandHandler("t", full_table))
+    # Бэкап/восстановление
     app.add_handler(CommandHandler("backup", backup))
-    app.add_handler(CommandHandler("restore", restore))
+    app.add_handler(CommandHandler("restore", restore_cmd))
     app.add_handler(MessageHandler(filters.Document.FileExtension("json"), handle_document))
 
     webhook_url = os.environ.get("WEBHOOK_URL")
