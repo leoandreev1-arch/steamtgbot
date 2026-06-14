@@ -20,11 +20,10 @@ def save_games(games):
 games = load_games()
 
 def get_steam_data(appid):
-    # Порядок: пытаемся всё лучшее на русском
     for region, lang, currency_label in [
-        ("ru", "russian", "₽"),      # Россия + русский
-        ("us", "russian", "USD"),    # США, но русский язык (если есть)
-        ("us", "english", "USD")     # США + английский (последний шанс)
+        ("ru", "russian", "₽"),
+        ("us", "russian", "USD"),
+        ("us", "english", "USD")
     ]:
         try:
             url = f"https://store.steampowered.com/api/appdetails?appids={appid}&cc={region}&l={lang}"
@@ -34,9 +33,15 @@ def get_steam_data(appid):
             if not data or str(appid) not in data or not data[str(appid)]["success"]:
                 continue
             g = data[str(appid)]["data"]
+
+            # Проверка демо
+            is_demo = g.get("is_demo", False) or g.get("type", "") == "demo"
+
             name = g.get("name", "Без названия")
             price_info = g.get("price_overview")
-            if price_info:
+            if is_demo:
+                price = "Демо"
+            elif price_info:
                 amount = price_info["final"] / 100
                 if currency_label == "₽":
                     price = f"{amount:.2f} ₽"
@@ -48,8 +53,6 @@ def get_steam_data(appid):
             genres_list = [x["description"] for x in g.get("genres", [])]
             genres = ", ".join(genres_list) if genres_list else "Не указаны"
             description = g.get("short_description", "—")
-
-            # Пометка, если язык не русский
             if lang != "russian":
                 description += " (описание на английском)"
 
