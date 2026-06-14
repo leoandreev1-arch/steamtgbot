@@ -6,7 +6,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["TOKEN"]
 CSV_FILE = "steam_games.csv"
-HEADERS = ["Дата обновления", "Название", "Цена (RUB)", "Жанры", "Ссылка"]
+HEADERS = ["Дата обновления", "Название", "Цена (RUB)", "Жанры", "Описание", "Ссылка"]
 
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
@@ -41,14 +41,27 @@ def get_steam_data(appid):
             return None
         g = data[str(appid)]["data"]
         name = g.get("name", "Без названия")
+
+        # Цена
         price_info = g.get("price_overview")
         if price_info:
             price = f"{price_info['final']/100:.2f} ₽"
         else:
             price = "Бесплатно" if g.get("is_free") else "Нет цены"
+
+        # Жанры
         genres_list = [x["description"] for x in g.get("genres", [])]
         genres = ", ".join(genres_list) if genres_list else "Не указаны"
-        return {"name": name, "price": price, "genres": genres}
+
+        # Описание (короткое)
+        description = g.get("short_description", "—")
+
+        return {
+            "name": name,
+            "price": price,
+            "genres": genres,
+            "description": description
+        }
     except Exception as e:
         logging.error(f"Steam error: {e}")
         return None
@@ -59,14 +72,16 @@ def format_table(games):
 
     sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
     table = "<b>📊 Сравнительная таблица игр</b>\n\n<pre>"
-    table += f"{'Название':<25} {'Цена':<12} {'Жанры':<30}\n"
-    table += "-" * 67 + "\n"
+    # Заголовки столбцов
+    table += f"{'Название':<20} {'Цена':<10} {'Жанры':<22} {'Описание':<35}\n"
+    table += "-" * 87 + "\n"
 
     for appid, row in sorted_games:
-        name = row.get("Название", "?")[:24]
-        price = row.get("Цена (RUB)", "?")[:11]
-        genres = row.get("Жанры", "?")[:29]
-        table += f"{name:<25} {price:<12} {genres:<30}\n"
+        name = row.get("Название", "?")[:19]
+        price = row.get("Цена (RUB)", "?")[:9]
+        genres = row.get("Жанры", "?")[:21]
+        desc = row.get("Описание", "—")[:34]
+        table += f"{name:<20} {price:<10} {genres:<22} {desc:<35}\n"
 
     table += "</pre>"
     table += f"\nВсего игр: <b>{len(games)}</b>\n"
@@ -93,6 +108,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Название": info["name"],
             "Цена (RUB)": info["price"],
             "Жанры": info["genres"],
+            "Описание": info["description"],
             "Ссылка": f"https://store.steampowered.com/app/{appid}/"
         }
 
@@ -103,6 +119,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎮 <b>{info['name']}</b>\n"
             f"💰 Цена: {info['price']}\n"
             f"🏷 Жанры: {info['genres']}\n"
+            f"📝 Описание: {info['description']}\n"
             f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>\n\n"
             f"<i>Таблица обновлена. Всего игр: {len(games)}</i>\n"
             f"Показать таблицу: /table"
@@ -125,7 +142,7 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
     app.add_handler(CommandHandler("table", table_command))
-    app.add_handler(CommandHandler("t", table_command))   # короткая команда
+    app.add_handler(CommandHandler("t", table_command))
     app.add_handler(CommandHandler("export", export))
 
     webhook_url = os.environ.get("WEBHOOK_URL")
