@@ -19,46 +19,41 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
+STORAGE_CHAT_ID = int(os.environ["STORAGE_CHAT_ID"])
 
 games: dict[str, dict] = {}
 storage_msg_id: int | None = None
-bot_self_chat_id: int | None = None   # ID личного чата с ботом
 
 
-# ── Восстановление из личного чата при старте ────────────────
-async def restore_from_saved(app: Application) -> None:
-    global games, storage_msg_id, bot_self_chat_id
-    me = await app.bot.get_me()
-    bot_self_chat_id = me.id   # положительный user_id
+async def restore_from_storage(app: Application) -> None:
+    """Восстанавливает таблицу из канала-хранилища."""
+    global games, storage_msg_id
     try:
-        # Получаем последнее сообщение в чате с самим собой
-        async for msg in app.bot.get_chat_history(chat_id=bot_self_chat_id, limit=1):
+        async for msg in app.bot.get_chat_history(chat_id=STORAGE_CHAT_ID, limit=1):
             if msg.text:
                 games = json.loads(msg.text)
                 storage_msg_id = msg.message_id
-                logger.info("Восстановлено %d игр из личного чата", len(games))
+                logger.info("Восстановлено %d игр из хранилища", len(games))
             else:
-                logger.warning("В личном чате нет текстового сообщения")
+                logger.warning("Нет текста в последнем сообщении хранилища")
     except Exception as exc:
         logger.warning("Не удалось восстановить: %s", exc)
 
 
-# ── Сохранение в личный чат ──────────────────────────────────
-async def save_to_saved(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global storage_msg_id, bot_self_chat_id
-    if bot_self_chat_id is None:
-        return
+async def save_to_storage(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сохраняет таблицу в канал-хранилище (редактирует или создаёт новое)."""
+    global storage_msg_id
     text = json.dumps(games, ensure_ascii=False)
     try:
         if storage_msg_id:
             await context.bot.edit_message_text(
-                chat_id=bot_self_chat_id,
+                chat_id=STORAGE_CHAT_ID,
                 message_id=storage_msg_id,
                 text=text,
             )
         else:
             msg = await context.bot.send_message(
-                chat_id=bot_self_chat_id,
+                chat_id=STORAGE_CHAT_ID,
                 text=text,
             )
             storage_msg_id = msg.message_id
@@ -156,7 +151,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         new_games += 1
 
     if new_games:
-        await save_to_saved(context)
+        await save_to_storage(context)
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
             f"Посмотреть: /show"
@@ -173,7 +168,7 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── Точка входа ──────────────────────────────────────────────
 def main() -> None:
-    app = Application.builder().token(TOKEN).post_init(restore_from_saved).build()
+    app = Application.builder().token(TOKEN).post_init(restore_from_storage).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("show", show_table))
