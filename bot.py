@@ -9,7 +9,6 @@ CSV_FILE = "steam_games.csv"
 HEADERS = ["Дата обновления", "Название", "Цена (RUB)", "Жанры", "Описание", "Ссылка"]
 
 if not os.path.exists(CSV_FILE):
-    # Создаём с BOM, чтобы Excel корректно открывал русский текст
     with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(HEADERS)
 
@@ -17,7 +16,6 @@ def load_existing_games():
     games = {}
     if not os.path.exists(CSV_FILE):
         return games
-    # Читаем с той же кодировкой
     with open(CSV_FILE, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -27,7 +25,6 @@ def load_existing_games():
     return games
 
 def save_all_games(games):
-    # Сохраняем с BOM
     with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=HEADERS)
         writer.writeheader()
@@ -72,15 +69,16 @@ def format_table(games):
 
     sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
     table = "<b>📊 Сравнительная таблица игр</b>\n\n<pre>"
-    table += f"{'Название':<20} {'Цена':<10} {'Жанры':<22} {'Описание':<35}\n"
-    table += "-" * 87 + "\n"
+    # Ширины: Название=15, Цена=8, Жанры=18, Описание=45
+    table += f"{'Название':<15} {'Цена':<8} {'Жанры':<18} {'Описание':<45}\n"
+    table += "-" * 86 + "\n"
 
     for appid, row in sorted_games:
-        name = row.get("Название", "?")[:19]
-        price = row.get("Цена (RUB)", "?")[:9]
-        genres = row.get("Жанры", "?")[:21]
-        desc = row.get("Описание", "—")[:34]
-        table += f"{name:<20} {price:<10} {genres:<22} {desc:<35}\n"
+        name = row.get("Название", "?")[:14]
+        price = row.get("Цена (RUB)", "?")[:7]
+        genres = row.get("Жанры", "?")[:17]
+        desc = row.get("Описание", "—")[:44]
+        table += f"{name:<15} {price:<8} {genres:<18} {desc:<45}\n"
 
     table += "</pre>"
     table += f"\nВсего игр: <b>{len(games)}</b>\n"
@@ -134,7 +132,6 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not os.path.exists(CSV_FILE) or os.path.getsize(CSV_FILE) == 0:
         await update.message.reply_text("Таблица пуста")
         return
-    # Отправляем как бинарный файл (BOM внутри уже есть)
     with open(CSV_FILE, "rb") as f:
         await update.message.reply_document(document=f, filename="steam_games.csv", caption="Таблица для Excel")
 
