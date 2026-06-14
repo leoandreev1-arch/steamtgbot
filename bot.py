@@ -6,7 +6,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["TOKEN"]
 DATA_FILE = "games.json"
-PIN_MSG_KEY = "pinned_chat_id"   # служебный ключ — в таблицу не выводится
+PIN_MSG_KEY = "pinned_chat_id"
 
 def load_games():
     if os.path.exists(DATA_FILE):
@@ -64,7 +64,6 @@ def get_steam_data(appid):
     return None
 
 def build_pin_text():
-    # Фильтруем: показываем только реальные игры (ключ — числовой appid)
     game_items = {k: v for k, v in games.items() if k != PIN_MSG_KEY}
     if not game_items:
         return "📊 Таблица пока пуста. Добавьте ссылку на игру Steam."
@@ -87,7 +86,7 @@ def build_pin_text():
 
     header = f"<b>📊 Игры в списке ({len(game_items)} шт.)</b>\n"
     separator = "\n" + "—" * 25 + "\n"
-    footer = "\n\nОбновить: /table | Кратко: /short"
+    footer = "\n\nОбновить: /full | Кратко: /short"
     return header + separator.join(blocks) + footer
 
 async def update_pin(context: ContextTypes.DEFAULT_TYPE):
@@ -173,25 +172,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ссылка": f"https://store.steampowered.com/app/{appid}/"
         }
         games[appid] = row
-        # Сохраняем id чата
         if PIN_MSG_KEY not in games:
             games[PIN_MSG_KEY] = {"chat_id": chat_id}
         else:
             games[PIN_MSG_KEY]["chat_id"] = chat_id
         save_games(games)
 
-        reply = (
-            f"🎮 <b>{info['name']}</b>\n"
-            f"💰 Цена: {info['price']}\n"
-            f"🏷 Жанры: {info['genres']}\n"
-            f"📝 {info['description']}\n"
-            f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>\n\n"
-            f"<i>Таблица обновлена. Всего игр: {len([k for k in games if k != PIN_MSG_KEY])}</i>\n"
-            f"Показать список: /table"
-        )
-        await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
-
     await update_pin(context)
+
+    # Короткий ответ вместо длинной карточки
+    game_count = len([k for k in games if k != PIN_MSG_KEY])
+    await update.message.reply_text(
+        f"✅ Игра добавлена. Всего игр: {game_count}\n"
+        f"Показать список: /full или /short"
+    )
 
 async def full_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = build_pin_text()
@@ -214,7 +208,7 @@ async def short_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
         link = row.get("Ссылка", f"https://store.steampowered.com/app/{appid}/")
         lines.append(f'• <a href="{link}">{name}</a> — {price}')
     lines.append(f"\nВсего игр: {len(game_items)}")
-    lines.append("Полная версия: /table")
+    lines.append("Полная версия: /full")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -239,7 +233,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             global games
             games = data
             save_games(games)
-            await update.message.reply_text(f"✅ Таблица восстановлена! Игр: {len([k for k in games if k != PIN_MSG_KEY])}")
+            cnt = len([k for k in games if k != PIN_MSG_KEY])
+            await update.message.reply_text(f"✅ Таблица восстановлена! Игр: {cnt}")
         else:
             await update.message.reply_text("❌ Неверный формат.")
     except Exception as e:
@@ -248,10 +243,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).post_init(restore_from_pin).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    app.add_handler(CommandHandler("table", full_table))
-    app.add_handler(CommandHandler("t", full_table))
+    app.add_handler(CommandHandler("full", full_table))
+    app.add_handler(CommandHandler("f", full_table))
     app.add_handler(CommandHandler("short", short_table))
     app.add_handler(CommandHandler("s", short_table))
+    # оставим и старые команды, чтобы не путать
+    app.add_handler(CommandHandler("table", full_table))
+    app.add_handler(CommandHandler("t", full_table))
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("restore", restore))
     app.add_handler(MessageHandler(filters.Document.FileExtension("json"), handle_document))
