@@ -5,7 +5,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["TOKEN"]
-DATA_FILE = "games.json"
+DATA_FILE = "games.json"          # локальный файл (на случай, если сообщение недоступно)
+PIN_MSG_KEY = "pinned_chat_id"    # ключ в games.json для хранения id чата и сообщения
 
 def load_games():
     if os.path.exists(DATA_FILE):
@@ -33,7 +34,6 @@ def get_steam_data(appid):
             if not data or str(appid) not in data or not data[str(appid)]["success"]:
                 continue
             g = data[str(appid)]["data"]
-
             is_demo = g.get("is_demo", False) or g.get("type", "") == "demo"
             name = g.get("name", "Без названия")
             price_info = g.get("price_overview")
@@ -47,13 +47,11 @@ def get_steam_data(appid):
                     price = f"{amount:.2f} USD" + (" (недоступна в РФ)" if region == "us" else "")
             else:
                 price = "Бесплатно" if g.get("is_free") else "Нет цены"
-
             genres_list = [x["description"] for x in g.get("genres", [])]
             genres = ", ".join(genres_list) if genres_list else "Не указаны"
             description = g.get("short_description", "—")
             if lang != "russian":
-                description += " (описание на английском)"
-
+                description = "—"
             return {
                 "name": name,
                 "price": price,
@@ -65,10 +63,10 @@ def get_steam_data(appid):
             continue
     return None
 
-def format_full_table():
+# ==== ТЕКСТ ТАБЛИЦЫ ДЛЯ ЗАКРЕПА (полная) ====
+def build_pin_text():
     if not games:
-        return "Таблица пока пуста. Киньте ссылку на игру Steam."
-
+        return "📊 Таблица пока пуста. Добавьте ссылку на игру Steam."
     sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
     blocks = []
     for appid, row in sorted_games:
@@ -84,29 +82,85 @@ def format_full_table():
             f"📝 <i>{desc}</i>"
         )
         blocks.append(block)
-
     header = f"<b>📊 Игры в списке ({len(games)} шт.)</b>\n"
     separator = "\n" + "—" * 25 + "\n"
-    footer = "\n\nКороткая версия: /short"
+    footer = "\n\nОбновить: /table | Кратко: /short"
     return header + separator.join(blocks) + footer
 
-def format_short_table():
-    if not games:
-        return "Таблица пока пуста. Киньте ссылку на игру Steam."
+async def update_pin(context: ContextTypes.DEFAULT_TYPE):
+    """Обновляет закреплённое сообщение в чате, где бот активен."""
+    chat_id = games.get(PIN_MSG_KEY, {}).get("chat_id")
+    msg_id = games.get(PIN_MSG_KEY, {}).get("msg_id")
+    text = build_pin_text()
+    if chat_id and msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
+        except Exception as e:
+            logging.warning(f"Не удалось отредактировать закреп: {e}")
 
-    sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
-    lines = ["<b>📋 Краткий список</b>\n"]
-    for appid, row in sorted_games:
-        name = row.get("Название", "?")
-        price = row.get("Цена", "?")
-        link = row.get("Ссылка", f"https://store.steampowered.com/app/{appid}/")
-        lines.append(f'• <a href="{link}">{name}</a> — {price}')
-    lines.append(f"\nВсего игр: {len(games)}")
-    lines.append("Полная версия: /table")
-    return "\n".join(lines)
+    # Если закрепа нет — пробуем создать новое в том же чате
+    if chat_id:
+        try:
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            await msg.pin()
+            games[PIN_MSG_KEY] = {"chat_id": chat_id, "msg_id": msg.message_id}
+            save_games(games)
+        except Exception as e:
+            logging.error(f"Ошибка создания закрепа: {e}")
 
+# ==== ВОССТАНОВЛЕНИЕ ИЗ ЗАКРЕПА ПРИ СТАРТЕ ====
+async def restore_from_pin(app):
+    """При старте пытается прочитать закреплённое сообщение и восстановить игры."""
+    chat_id = games.get(PIN_MSG_KEY, {}).get("chat_id")
+    msg_id = games.get(PIN_MSG_KEY, {}).get("msg_id")
+    if not chat_id or not msg_id:
+        return
+    try:
+        msg = await app.bot.get_message(chat_id=chat_id, message_id=msg_id)
+        text = msg.text or msg.caption
+        if not text:
+            return
+        # Парсим текст обратно в словарь games (упрощённо: ищем ссылки steam)
+        # Так как в тексте есть ссылки вида href="...app/ID/", мы можем вытащить appid
+        new_games = {}
+        pattern = r'href="https?://store\.steampowered\.com/app/(\d+)/"'
+        for match in re.finditer(pattern, text):
+            appid = match.group(1)
+            # Данные из текста вытаскивать сложно, проще заново запросить Steam
+            # Но мы можем сохранить только appid и ссылки, а остальное обновится при следующем добавлении
+            new_games[appid] = {
+                "Дата обновления": "восстановлено",
+                "Название": "? (обновите ссылку)",
+                "Цена": "?",
+                "Жанры": "?",
+                "Описание": "?",
+                "Ссылка": f"https://store.steampowered.com/app/{appid}/"
+            }
+        if new_games:
+            global games
+            games.update(new_games)
+            save_games(games)
+            logging.info(f"Восстановлено {len(new_games)} игр из закрепа")
+    except Exception as e:
+        logging.warning(f"Не удалось восстановить из закрепа: {e}")
+
+# ==== КОМАНДЫ ====
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
+    # Запоминаем чат для закрепа
+    chat_id = update.effective_chat.id
     pattern = r"https?://store\.steampowered\.com/app/(\d+)"
     appids = re.findall(pattern, text)
     if not appids:
@@ -126,8 +180,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Описание": info["description"],
             "Ссылка": f"https://store.steampowered.com/app/{appid}/"
         }
-
         games[appid] = row
+        if PIN_MSG_KEY not in games:
+            games[PIN_MSG_KEY] = {"chat_id": chat_id}
+        else:
+            games[PIN_MSG_KEY]["chat_id"] = chat_id
         save_games(games)
 
         reply = (
@@ -136,20 +193,39 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏷 Жанры: {info['genres']}\n"
             f"📝 {info['description']}\n"
             f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>\n\n"
-            f"<i>Таблица обновлена. Всего игр: {len(games)}</i>\n"
+            f"<i>Таблица обновлена. Всего игр: {len(games)-1}</i>\n"
             f"Показать список: /table"
         )
         await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
 
-async def full_table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    table = format_full_table()
-    await update.message.reply_text(table, parse_mode="HTML")
+    # Обновляем закреп
+    await update_pin(context)
 
-async def short_table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    table = format_short_table()
-    await update.message.reply_text(table, parse_mode="HTML")
+async def full_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = build_pin_text()
+    await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+    # Обновим закреп на всякий случай
+    if PIN_MSG_KEY not in games:
+        games[PIN_MSG_KEY] = {"chat_id": update.effective_chat.id}
+        save_games(games)
+    await update_pin(context)
 
-async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def short_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not games:
+        await update.message.reply_text("Таблица пока пуста.")
+        return
+    sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
+    lines = ["<b>📋 Краткий список</b>\n"]
+    for appid, row in sorted_games:
+        name = row.get("Название", "?")
+        price = row.get("Цена", "?")
+        link = row.get("Ссылка", f"https://store.steampowered.com/app/{appid}/")
+        lines.append(f'• <a href="{link}">{name}</a> — {price}')
+    lines.append(f"\nВсего игр: {len(games)}")
+    lines.append("Полная версия: /table")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not os.path.exists(DATA_FILE):
         await update.message.reply_text("Нет данных для резервного копирования.")
         return
@@ -157,10 +233,10 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=f,
             filename="games_backup.json",
-            caption="Резервная копия таблицы."
+            caption="Резервная копия."
         )
 
-async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отправь мне файл games_backup.json для восстановления.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -175,22 +251,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             global games
             games = data
             save_games(games)
-            await update.message.reply_text(f"✅ Таблица восстановлена! Игр: {len(games)}")
+            await update.message.reply_text(f"✅ Таблица восстановлена! Игр: {len(games)-1}")
         else:
             await update.message.reply_text("❌ Неверный формат файла.")
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка восстановления: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    app.add_handler(CommandHandler("table", full_table_command))
-    app.add_handler(CommandHandler("t", full_table_command))
-    app.add_handler(CommandHandler("short", short_table_command))
-    app.add_handler(CommandHandler("s", short_table_command))
-    app.add_handler(CommandHandler("backup", backup_command))
-    app.add_handler(CommandHandler("restore", restore_command))
+    app.add_handler(CommandHandler("table", full_table))
+    app.add_handler(CommandHandler("t", full_table))
+    app.add_handler(CommandHandler("short", short_table))
+    app.add_handler(CommandHandler("s", short_table))
+    app.add_handler(CommandHandler("backup", backup))
+    app.add_handler(CommandHandler("restore", restore))
     app.add_handler(MessageHandler(filters.Document.FileExtension("json"), handle_document))
+
+    # Восстановление из закрепа при старте
+    import asyncio
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(restore_from_pin(app))
 
     webhook_url = os.environ.get("WEBHOOK_URL")
     if webhook_url:
