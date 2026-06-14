@@ -7,9 +7,35 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["TOKEN"]
 CSV_FILE = "steam_games.csv"
 
+# Заголовки
+HEADERS = ["Дата обновления", "Название", "Цена (RUB)", "Жанры", "Ссылка"]
+
+# Если файла нет — создаём с заголовками
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(["Дата", "Название", "Цена (RUB)", "Жанры", "Ссылка"])
+        csv.writer(f).writerow(HEADERS)
+
+def load_existing_games():
+    """Читает таблицу и возвращает словарь: appid -> {данные строки}"""
+    games = {}
+    if not os.path.exists(CSV_FILE):
+        return games
+    with open(CSV_FILE, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Из ссылки извлекаем appid
+            match = re.search(r"/app/(\d+)/?", row.get("Ссылка", ""))
+            if match:
+                games[match.group(1)] = row
+    return games
+
+def save_all_games(games):
+    """Перезаписывает CSV целиком из словаря games (без дубликатов)"""
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=HEADERS)
+        writer.writeheader()
+        for appid, info in games.items():
+            writer.writerow(info)
 
 def get_steam_data(appid):
     try:
@@ -23,7 +49,6 @@ def get_steam_data(appid):
 
         name = g.get("name", "Без названия")
 
-        # Цена в рублях
         price_info = g.get("price_overview")
         if price_info:
             rubles = price_info["final"] / 100
@@ -31,14 +56,12 @@ def get_steam_data(appid):
         else:
             price = "Бесплатно" if g.get("is_free") else "Нет цены"
 
-        # Жанры
         genres_list = [x["description"] for x in g.get("genres", [])]
         genres = ", ".join(genres_list) if genres_list else "Не указаны"
 
         return {"name": name, "price": price, "genres": genres}
-
     except Exception as e:
-        logging.error(f"Ошибка Steam API: {e}")
+        logging.error(f"Steam error: {e}")
         return None
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -47,27 +70,37 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     appids = re.findall(pattern, text)
     if not appids:
         return
+
+    # Загружаем текущую таблицу
+    games = load_existing_games()
+
     for appid in set(appids):
         info = get_steam_data(appid)
         if not info:
             await update.message.reply_text(f"❌ Не удалось получить данные для {appid}")
             continue
 
-        row = [
-            datetime.now().strftime("%Y-%m-%d %H:%M"),
-            info["name"],
-            info["price"],
-            info["genres"],
-            f"https://store.steampowered.com/app/{appid}/"
-        ]
-        with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(row)
+        # Формируем строку (ссылку фиксируем)
+        row = {
+            "Дата обновления": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Название": info["name"],
+            "Цена (RUB)": info["price"],
+            "Жанры": info["genres"],
+            "Ссылка": f"https://store.steampowered.com/app/{appid}/"
+        }
+
+        # Обновляем или добавляем запись
+        games[appid] = row
+
+        # Сохраняем таблицу
+        save_all_games(games)
 
         reply = (
             f"🎮 <b>{info['name']}</b>\n"
             f"💰 Цена: {info['price']}\n"
             f"🏷 Жанры: {info['genres']}\n"
-            f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>"
+            f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>\n\n"
+            f"<i>Таблица обновлена. Всего игр: {len(games)}</i>"
         )
         await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
 
@@ -76,7 +109,7 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Таблица пуста")
         return
     with open(CSV_FILE, "rb") as f:
-        await update.message.reply_document(document=f, filename="steam_games.csv", caption="Таблица")
+        await update.message.reply_document(document=f, filename="steam_games.csv", caption="Сравнительная таблица")
 
 def main():
     app = Application.builder().token(TOKEN).build()
