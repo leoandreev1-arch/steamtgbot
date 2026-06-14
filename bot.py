@@ -6,7 +6,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["TOKEN"]
 DATA_FILE = "games.json"
-PIN_MSG_KEY = "pinned_chat_id"
+PIN_MSG_KEY = "pinned_chat_id"   # служебный ключ — в таблицу не выводится
 
 def load_games():
     if os.path.exists(DATA_FILE):
@@ -64,9 +64,12 @@ def get_steam_data(appid):
     return None
 
 def build_pin_text():
-    if not games:
+    # Фильтруем: показываем только реальные игры (ключ — числовой appid)
+    game_items = {k: v for k, v in games.items() if k != PIN_MSG_KEY}
+    if not game_items:
         return "📊 Таблица пока пуста. Добавьте ссылку на игру Steam."
-    sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
+
+    sorted_games = sorted(game_items.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
     blocks = []
     for appid, row in sorted_games:
         name = row.get("Название", "?")
@@ -81,7 +84,8 @@ def build_pin_text():
             f"📝 <i>{desc}</i>"
         )
         blocks.append(block)
-    header = f"<b>📊 Игры в списке ({len(games)} шт.)</b>\n"
+
+    header = f"<b>📊 Игры в списке ({len(game_items)} шт.)</b>\n"
     separator = "\n" + "—" * 25 + "\n"
     footer = "\n\nОбновить: /table | Кратко: /short"
     return header + separator.join(blocks) + footer
@@ -117,7 +121,6 @@ async def update_pin(context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Ошибка создания закрепа: {e}")
 
 async def restore_from_pin(app: Application):
-    """Восстановление из закреплённого сообщения при старте."""
     global games
     chat_id = games.get(PIN_MSG_KEY, {}).get("chat_id")
     msg_id = games.get(PIN_MSG_KEY, {}).get("msg_id")
@@ -170,6 +173,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ссылка": f"https://store.steampowered.com/app/{appid}/"
         }
         games[appid] = row
+        # Сохраняем id чата
         if PIN_MSG_KEY not in games:
             games[PIN_MSG_KEY] = {"chat_id": chat_id}
         else:
@@ -182,7 +186,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏷 Жанры: {info['genres']}\n"
             f"📝 {info['description']}\n"
             f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>\n\n"
-            f"<i>Таблица обновлена. Всего игр: {len(games)-1}</i>\n"
+            f"<i>Таблица обновлена. Всего игр: {len([k for k in games if k != PIN_MSG_KEY])}</i>\n"
             f"Показать список: /table"
         )
         await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
@@ -198,17 +202,18 @@ async def full_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_pin(context)
 
 async def short_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not games:
+    game_items = {k: v for k, v in games.items() if k != PIN_MSG_KEY}
+    if not game_items:
         await update.message.reply_text("Таблица пока пуста.")
         return
-    sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
+    sorted_games = sorted(game_items.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
     lines = ["<b>📋 Краткий список</b>\n"]
     for appid, row in sorted_games:
         name = row.get("Название", "?")
         price = row.get("Цена", "?")
         link = row.get("Ссылка", f"https://store.steampowered.com/app/{appid}/")
         lines.append(f'• <a href="{link}">{name}</a> — {price}')
-    lines.append(f"\nВсего игр: {len(games)}")
+    lines.append(f"\nВсего игр: {len(game_items)}")
     lines.append("Полная версия: /table")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
@@ -234,7 +239,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             global games
             games = data
             save_games(games)
-            await update.message.reply_text(f"✅ Таблица восстановлена! Игр: {len(games)-1}")
+            await update.message.reply_text(f"✅ Таблица восстановлена! Игр: {len([k for k in games if k != PIN_MSG_KEY])}")
         else:
             await update.message.reply_text("❌ Неверный формат.")
     except Exception as e:
