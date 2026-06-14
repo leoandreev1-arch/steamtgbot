@@ -63,7 +63,7 @@ def get_steam_data(appid):
             continue
     return None
 
-# ==== Текст таблицы для закрепа и команд ====
+# Текст таблицы для команд и закрепа
 def build_pin_text():
     game_items = {k: v for k, v in games.items() if k != PIN_MSG_KEY}
     if not game_items:
@@ -91,7 +91,7 @@ def build_pin_text():
     return header + separator.join(blocks) + footer
 
 async def update_pin(context: ContextTypes.DEFAULT_TYPE):
-    """Обновляет закреплённое сообщение, вызывается только при добавлении игры."""
+    """Создаёт или обновляет закреплённое сообщение (только по команде /pin)."""
     chat_id = games.get(PIN_MSG_KEY, {}).get("chat_id")
     msg_id = games.get(PIN_MSG_KEY, {}).get("msg_id")
     text = build_pin_text()
@@ -176,23 +176,21 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ссылка": f"https://store.steampowered.com/app/{appid}/"
         }
         games[appid] = row
+        # Сохраняем id чата для будущего закрепа (но сам закреп не трогаем)
         if PIN_MSG_KEY not in games:
             games[PIN_MSG_KEY] = {"chat_id": chat_id}
         else:
             games[PIN_MSG_KEY]["chat_id"] = chat_id
         save_games(games)
 
-    # Обновляем закреп
-    await update_pin(context)
-
     game_count = len([k for k in games if k != PIN_MSG_KEY])
     await update.message.reply_text(
         f"✅ Игра добавлена. Всего игр: {game_count}\n"
-        f"Показать список: /full или /short"
+        f"Показать список: /full или /short\n"
+        f"Закрепить таблицу: /pin"
     )
 
 async def full_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Просто показывает полную таблицу, без изменения закрепа."""
     text = build_pin_text()
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
@@ -211,6 +209,11 @@ async def short_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"\nВсего игр: {len(game_items)}")
     lines.append("Полная версия: /full")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительно обновляет закреплённое сообщение."""
+    await update_pin(context)
+    await update.message.reply_text("✅ Таблица закреплена / обновлена.")
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not os.path.exists(DATA_FILE):
@@ -249,9 +252,10 @@ def main():
     app.add_handler(CommandHandler("f", full_table))
     app.add_handler(CommandHandler("short", short_table))
     app.add_handler(CommandHandler("s", short_table))
-    # Для совместимости оставим старые названия
     app.add_handler(CommandHandler("table", full_table))
     app.add_handler(CommandHandler("t", full_table))
+    # Управление закрепом
+    app.add_handler(CommandHandler("pin", pin_command))
     # Бэкап/восстановление
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("restore", restore_cmd))
