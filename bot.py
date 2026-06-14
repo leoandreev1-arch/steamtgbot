@@ -30,19 +30,19 @@ async def restore_from_saved(app: Application) -> None:
     """Восстанавливает таблицу из личного чата бота (Saved Messages)."""
     global games, storage_msg_id, bot_user_id
     try:
-        # Получаем ID бота (положительное число)
         me = await app.bot.get_me()
         bot_user_id = me.id
 
-        # Читаем последнее сообщение в чате с самим собой через HTTP-запрос
         resp = requests.get(
             f"{API_URL}/getChatHistory",
             params={"chat_id": bot_user_id, "limit": 1},
             timeout=10,
         )
         data = resp.json()
+
         if not data.get("ok"):
-            logger.warning("Ошибка API при восстановлении: %s", data)
+            # Чат пуст или ещё не создан – не ошибка
+            logger.info("Личный чат бота пуст (ок)")
             return
 
         messages = data["result"]["messages"]
@@ -51,7 +51,7 @@ async def restore_from_saved(app: Application) -> None:
             storage_msg_id = messages[0]["message_id"]
             logger.info("Восстановлено %d игр из личного чата", len(games))
         else:
-            logger.info("Личный чат бота пуст")
+            logger.info("В личном чате нет текстовых сообщений")
     except Exception as exc:
         logger.warning("Не удалось восстановить: %s", exc)
 
@@ -72,6 +72,7 @@ async def save_to_saved(context: ContextTypes.DEFAULT_TYPE) -> None:
         data = resp.json()
         if data.get("ok"):
             storage_msg_id = data["result"]["message_id"]
+            logger.debug("Игры сохранены в личном чате")
         else:
             logger.error("Ошибка сохранения: %s", data)
     except Exception as exc:
