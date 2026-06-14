@@ -19,66 +19,63 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
-STORAGE_CHAT_ID = int(os.environ["STORAGE_CHAT_ID"])
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 games: dict[str, dict] = {}
 storage_msg_id: int | None = None
+bot_user_id: int | None = None
 
 
-# ── Восстановление через HTTP-запрос к Telegram API ─────────
-async def restore_from_storage(app: Application) -> None:
-    global games, storage_msg_id
+async def restore_from_saved(app: Application) -> None:
+    """Восстанавливает таблицу из личного чата бота (Saved Messages)."""
+    global games, storage_msg_id, bot_user_id
     try:
-        # Получаем последнее сообщение из канала через прямой запрос к API
+        # Получаем ID бота (положительное число)
+        me = await app.bot.get_me()
+        bot_user_id = me.id
+
+        # Читаем последнее сообщение в чате с самим собой через HTTP-запрос
         resp = requests.get(
             f"{API_URL}/getChatHistory",
-            params={
-                "chat_id": STORAGE_CHAT_ID,
-                "limit": 1,
-            },
+            params={"chat_id": bot_user_id, "limit": 1},
             timeout=10,
         )
         data = resp.json()
         if not data.get("ok"):
-            logger.warning("Ошибка API: %s", data)
+            logger.warning("Ошибка API при восстановлении: %s", data)
             return
 
         messages = data["result"]["messages"]
-        if messages:
-            msg = messages[0]
-            if "text" in msg:
-                games = json.loads(msg["text"])
-                storage_msg_id = msg["message_id"]
-                logger.info("Восстановлено %d игр из хранилища", len(games))
-            else:
-                logger.warning("Последнее сообщение не содержит текста")
+        if messages and "text" in messages[0]:
+            games = json.loads(messages[0]["text"])
+            storage_msg_id = messages[0]["message_id"]
+            logger.info("Восстановлено %d игр из личного чата", len(games))
         else:
-            logger.info("Хранилище пусто")
+            logger.info("Личный чат бота пуст")
     except Exception as exc:
         logger.warning("Не удалось восстановить: %s", exc)
 
 
-async def save_to_storage(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global storage_msg_id
+async def save_to_saved(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сохраняет таблицу в личный чат бота."""
+    global storage_msg_id, bot_user_id
+    if bot_user_id is None:
+        return
+
     text = json.dumps(games, ensure_ascii=False)
     try:
-        # Всегда отправляем новое сообщение (проще и надёжнее)
         resp = requests.post(
             f"{API_URL}/sendMessage",
-            json={
-                "chat_id": STORAGE_CHAT_ID,
-                "text": text,
-            },
+            json={"chat_id": bot_user_id, "text": text},
             timeout=10,
         )
         data = resp.json()
         if data.get("ok"):
             storage_msg_id = data["result"]["message_id"]
         else:
-            logger.error("Ошибка отправки: %s", data)
+            logger.error("Ошибка сохранения: %s", data)
     except Exception as exc:
-        logger.error("Ошибка сохранения: %s", exc)
+        logger.error("Исключение при сохранении: %s", exc)
 
 
 # ── Steam API ─────────────────────────────────────────────────
@@ -171,7 +168,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         new_games += 1
 
     if new_games:
-        await save_to_storage(context)
+        await save_to_saved(context)
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
             f"Посмотреть: /show"
@@ -188,7 +185,7 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── Точка входа ──────────────────────────────────────────────
 def main() -> None:
-    app = Application.builder().token(TOKEN).post_init(restore_from_storage).build()
+    app = Application.builder().token(TOKEN).post_init(restore_from_saved).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("show", show_table))
