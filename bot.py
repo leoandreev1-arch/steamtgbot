@@ -9,37 +9,53 @@ CSV_FILE = "steam_games.csv"
 
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(["Дата", "Название", "Цена", "Жанры", "Metacritic", "Рейтинг игроков", "Ссылка"])
+        csv.writer(f).writerow(["Дата", "Название", "Цена (RUB)", "Жанры", "Отзывы", "Ссылка"])
 
 def get_steam_data(appid):
+    """Получает данные об игре с русским языком и ценами в рублях"""
     try:
-        r = requests.get(f"https://store.steampowered.com/api/appdetails?appids={appid}", timeout=10)
+        url = f"https://store.steampowered.com/api/appdetails?appids={appid}&cc=ru&l=russian"
+        r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
         if not data or str(appid) not in data or not data[str(appid)]["success"]:
             return None
         g = data[str(appid)]["data"]
-        name = g.get("name", "?")
+
+        name = g.get("name", "Без названия")
+
+        # Цена в рублях
         price_info = g.get("price_overview")
         if price_info:
-            price = f"{price_info['final']/100:.2f} {price_info.get('currency','')}"
+            # final в копейках, переводим в рубли
+            rubles = price_info["final"] / 100
+            price = f"{rubles:.2f} ₽"
         else:
             price = "Бесплатно" if g.get("is_free") else "Нет цены"
-        genres = ", ".join(x["description"] for x in g.get("genres", [])) or "Не указаны"
-        mc = g.get("metacritic", {}).get("score", "—")
 
-        # Новый понятный рейтинг игроков
-        review_desc = g.get("review_score_desc", "Нет оценок")
-        total_reviews = g.get("recommendations", {}).get("total", 0)
-        if total_reviews > 0:
+        # Жанры (уже на русском, если есть)
+        genres_list = [x["description"] for x in g.get("genres", [])]
+        genres = ", ".join(genres_list) if genres_list else "Не указаны"
+
+        # Отзывы игроков
+        review_desc = g.get("review_score_desc", "")
+        total_reviews = g.get("total_reviews", 0)
+        if total_reviews and review_desc:
             player_rating = f"{review_desc} ({total_reviews} обз.)"
+        elif review_desc:
+            player_rating = review_desc
         else:
-            player_rating = "Нет обзоров"
+            player_rating = "Нет оценок"
 
-        return {"name": name, "price": price, "genres": genres,
-                "metacritic": mc, "player_rating": player_rating}
+        return {
+            "name": name,
+            "price": price,
+            "genres": genres,
+            "player_rating": player_rating
+        }
+
     except Exception as e:
-        logging.error(e)
+        logging.error(f"Ошибка Steam API для appid {appid}: {e}")
         return None
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -48,22 +64,31 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     appids = re.findall(pattern, text)
     if not appids:
         return
+
     for appid in set(appids):
         info = get_steam_data(appid)
         if not info:
             await update.message.reply_text(f"❌ Не удалось получить данные для приложения {appid}")
             continue
-        row = [datetime.now().strftime("%Y-%m-%d %H:%M"), info["name"], info["price"],
-               info["genres"], info["metacritic"], info["player_rating"],
-               f"https://store.steampowered.com/app/{appid}/"]
+
+        row = [
+            datetime.now().strftime("%Y-%m-%d %H:%M"),
+            info["name"],
+            info["price"],
+            info["genres"],
+            info["player_rating"],
+            f"https://store.steampowered.com/app/{appid}/"
+        ]
         with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(row)
-        reply = (f"🎮 <b>{info['name']}</b>\n"
-                 f"💰 Цена: {info['price']}\n"
-                 f"🏷 Жанры: {info['genres']}\n"
-                 f"⭐ Metacritic: {info['metacritic']}\n"
-                 f"👍 Игроки: {info['player_rating']}\n"
-                 f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>")
+
+        reply = (
+            f"🎮 <b>{info['name']}</b>\n"
+            f"💰 Цена: {info['price']}\n"
+            f"🏷 Жанры: {info['genres']}\n"
+            f"👍 Отзывы: {info['player_rating']}\n"
+            f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>"
+        )
         await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
