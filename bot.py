@@ -9,9 +9,11 @@ TOKEN = os.environ["TOKEN"]
 games = {}
 
 def get_steam_data(appid):
+    # Попытка 1: Россия + русский (идеальный вариант)
     for region, lang, currency_label in [
-        ("ru", "russian", "RUB"),
-        ("us", "english", "USD")
+        ("ru", "russian", "₽"),
+        ("ru", "english", "₽"),   # если нет русского описания, но цена в рублях
+        ("us", "english", "USD")   # fallback
     ]:
         try:
             url = f"https://store.steampowered.com/api/appdetails?appids={appid}&cc={region}&l={lang}"
@@ -25,22 +27,31 @@ def get_steam_data(appid):
             name = g.get("name", "Без названия")
             price_info = g.get("price_overview")
             if price_info:
-                price = f"{price_info['final']/100:.2f} {currency_label}"
+                amount = price_info["final"] / 100
+                if currency_label == "₽":
+                    price = f"{amount:.2f} ₽"
+                else:
+                    price = f"{amount:.2f} USD (игра недоступна в РФ)"
             else:
                 price = "Бесплатно" if g.get("is_free") else "Нет цены"
+
             genres_list = [x["description"] for x in g.get("genres", [])]
             genres = ", ".join(genres_list) if genres_list else "Не указаны"
+
             description = g.get("short_description", "—")
+
+            # Если описание на английском, добавим пометку
+            if lang == "english" and region == "ru":
+                description += " (описание на английском)"
 
             return {
                 "name": name,
                 "price": price,
                 "genres": genres,
-                "description": description,
-                "currency": currency_label
+                "description": description
             }
         except Exception as e:
-            logging.error(f"Steam error for {appid} (cc={region}): {e}")
+            logging.error(f"Steam error for {appid} (cc={region}, l={lang}): {e}")
             continue
     return None
 
