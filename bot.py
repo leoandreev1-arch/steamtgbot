@@ -1,4 +1,4 @@
-import re, csv, os, logging, requests
+import re, csv, os, logging, requests, json
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -22,28 +22,44 @@ def get_steam_data(appid):
             return None
         g = data[str(appid)]["data"]
 
+        # Для отладки выведем в логи ВСЕ поля игры (можно будет посмотреть на Render)
+        logging.info(f"Steam data for appid {appid}: {json.dumps(g, ensure_ascii=False, indent=2)}")
+
         name = g.get("name", "Без названия")
 
         # Цена в рублях
         price_info = g.get("price_overview")
         if price_info:
-            # final в копейках, переводим в рубли
             rubles = price_info["final"] / 100
             price = f"{rubles:.2f} ₽"
         else:
             price = "Бесплатно" if g.get("is_free") else "Нет цены"
 
-        # Жанры (уже на русском, если есть)
+        # Жанры
         genres_list = [x["description"] for x in g.get("genres", [])]
         genres = ", ".join(genres_list) if genres_list else "Не указаны"
 
-        # Отзывы игроков
-        review_desc = g.get("review_score_desc", "")
-        total_reviews = g.get("total_reviews", 0)
+        # Отзывы: пробуем несколько вариантов
+        review_desc = g.get("review_score_desc", "")  # Например "Очень положительные"
+        if review_desc:
+            review_desc = review_desc.strip()
+
+        # Количество обзоров
+        total_reviews = g.get("total_reviews")  # Современное поле
+        if not total_reviews:
+            # Запасной вариант через recommendations
+            rec = g.get("recommendations", {})
+            if rec:
+                total_reviews = rec.get("total", 0)
+
+        # Собираем строку рейтинга
         if total_reviews and review_desc:
             player_rating = f"{review_desc} ({total_reviews} обз.)"
         elif review_desc:
             player_rating = review_desc
+        elif total_reviews:
+            # Есть количество, но нет описания (маловероятно)
+            player_rating = f"Отзывы: {total_reviews}"
         else:
             player_rating = "Нет оценок"
 
