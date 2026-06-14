@@ -19,64 +19,88 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
+GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 games: dict[str, dict] = {}
-storage_msg_id: int | None = None
-bot_user_id: int | None = None
+pinned_msg_id: int | None = None
 
 
-async def restore_from_saved(app: Application) -> None:
-    """Восстанавливает таблицу из личного чата бота (Saved Messages)."""
-    global games, storage_msg_id, bot_user_id
+# ── Восстановление из закрепа при старте ────────────────────
+async def restore_from_pinned(app: Application) -> None:
+    global games, pinned_msg_id
     try:
-        me = await app.bot.get_me()
-        bot_user_id = me.id
-
+        # Получаем информацию о чате (включая закреплённое сообщение)
         resp = requests.get(
-            f"{API_URL}/getChatHistory",
-            params={"chat_id": bot_user_id, "limit": 1},
+            f"{API_URL}/getChat",
+            params={"chat_id": GROUP_CHAT_ID},
             timeout=10,
         )
         data = resp.json()
-
         if not data.get("ok"):
-            # Чат пуст или ещё не создан – не ошибка
-            logger.info("Личный чат бота пуст (ок)")
+            logger.warning("Ошибка получения чата: %s", data)
             return
 
-        messages = data["result"]["messages"]
-        if messages and "text" in messages[0]:
-            games = json.loads(messages[0]["text"])
-            storage_msg_id = messages[0]["message_id"]
-            logger.info("Восстановлено %d игр из личного чата", len(games))
+        pinned = data["result"].get("pinned_message")
+        if pinned and "text" in pinned:
+            games = json.loads(pinned["text"])
+            pinned_msg_id = pinned["message_id"]
+            logger.info("Восстановлено %d игр из закрепа", len(games))
         else:
-            logger.info("В личном чате нет текстовых сообщений")
+            logger.info("Закреплённое сообщение не найдено или пусто")
     except Exception as exc:
-        logger.warning("Не удалось восстановить: %s", exc)
+        logger.warning("Ошибка восстановления: %s", exc)
 
 
-async def save_to_saved(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Сохраняет таблицу в личный чат бота."""
-    global storage_msg_id, bot_user_id
-    if bot_user_id is None:
-        return
-
+async def save_to_pinned(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сохраняет таблицу в закреплённое сообщение (редактирует или создаёт новое)."""
+    global pinned_msg_id
     text = json.dumps(games, ensure_ascii=False)
     try:
-        resp = requests.post(
-            f"{API_URL}/sendMessage",
-            json={"chat_id": bot_user_id, "text": text},
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get("ok"):
-            storage_msg_id = data["result"]["message_id"]
-            logger.debug("Игры сохранены в личном чате")
-        else:
-            logger.error("Ошибка сохранения: %s", data)
+        if pinned_msg_id:
+            # Редактируем существующее закреплённое
+            resp = requests.post(
+                f"{API_URL}/editMessageText",
+                json={
+                    "chat_id": GROUP_CHAT_ID,
+                    "message_id": pinned_msg_id,
+                    "text": text,
+                },
+                timeout=10,
+            )
+            data = resp.json()
+            if not data.get("ok"):
+                logger.warning("Не удалось отредактировать закреп: %s", data)
+                # Если не вышло — создадим новое
+                pinned_msg_id = None
+
+        if not pinned_msg_id:
+            # Отправляем новое сообщение и закрепляем его
+            resp = requests.post(
+                f"{API_URL}/sendMessage",
+                json={
+                    "chat_id": GROUP_CHAT_ID,
+                    "text": text,
+                },
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("ok"):
+                new_msg_id = data["result"]["message_id"]
+                # Закрепляем
+                requests.post(
+                    f"{API_URL}/pinChatMessage",
+                    json={
+                        "chat_id": GROUP_CHAT_ID,
+                        "message_id": new_msg_id,
+                    },
+                    timeout=10,
+                )
+                pinned_msg_id = new_msg_id
+            else:
+                logger.error("Ошибка создания закрепа: %s", data)
     except Exception as exc:
-        logger.error("Исключение при сохранении: %s", exc)
+        logger.error("Ошибка сохранения в закреп: %s", exc)
 
 
 # ── Steam API ─────────────────────────────────────────────────
@@ -169,7 +193,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         new_games += 1
 
     if new_games:
-        await save_to_saved(context)
+        await save_to_pinned(context)
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
             f"Посмотреть: /show"
@@ -186,7 +210,7 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── Точка входа ──────────────────────────────────────────────
 def main() -> None:
-    app = Application.builder().token(TOKEN).post_init(restore_from_saved).build()
+    app = Application.builder().token(TOKEN).post_init(restore_from_pinned).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("show", show_table))
