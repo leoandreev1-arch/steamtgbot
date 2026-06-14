@@ -6,31 +6,25 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["TOKEN"]
 CSV_FILE = "steam_games.csv"
-
-# Заголовки
 HEADERS = ["Дата обновления", "Название", "Цена (RUB)", "Жанры", "Ссылка"]
 
-# Если файла нет — создаём с заголовками
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(HEADERS)
 
 def load_existing_games():
-    """Читает таблицу и возвращает словарь: appid -> {данные строки}"""
     games = {}
     if not os.path.exists(CSV_FILE):
         return games
     with open(CSV_FILE, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # Из ссылки извлекаем appid
             match = re.search(r"/app/(\d+)/?", row.get("Ссылка", ""))
             if match:
                 games[match.group(1)] = row
     return games
 
 def save_all_games(games):
-    """Перезаписывает CSV целиком из словаря games (без дубликатов)"""
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=HEADERS)
         writer.writeheader()
@@ -46,23 +40,42 @@ def get_steam_data(appid):
         if not data or str(appid) not in data or not data[str(appid)]["success"]:
             return None
         g = data[str(appid)]["data"]
-
         name = g.get("name", "Без названия")
-
         price_info = g.get("price_overview")
         if price_info:
-            rubles = price_info["final"] / 100
-            price = f"{rubles:.2f} ₽"
+            price = f"{price_info['final']/100:.2f} ₽"
         else:
             price = "Бесплатно" if g.get("is_free") else "Нет цены"
-
         genres_list = [x["description"] for x in g.get("genres", [])]
         genres = ", ".join(genres_list) if genres_list else "Не указаны"
-
         return {"name": name, "price": price, "genres": genres}
     except Exception as e:
         logging.error(f"Steam error: {e}")
         return None
+
+def format_table(games):
+    """Форматирует словарь игр в красивую текстовую таблицу"""
+    if not games:
+        return "Таблица пока пуста. Киньте ссылку на игру Steam."
+
+    # Сортируем по дате добавления (новые сверху)
+    sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
+
+    table = "<b>📊 Сравнительная таблица игр</b>\n\n"
+    table += "<pre>"
+    table += f"{'Название':<25} {'Цена':<12} {'Жанры':<30}\n"
+    table += "-" * 67 + "\n"
+
+    for appid, row in sorted_games:
+        name = row.get("Название", "?")[:24]  # Обрезаем длинные названия
+        price = row.get("Цена (RUB)", "?")[:11]
+        genres = row.get("Жанры", "?")[:29]
+        table += f"{name:<25} {price:<12} {genres:<30}\n"
+
+    table += "</pre>"
+    table += f"\nВсего игр: <b>{len(games)}</b>"
+    table += "\nПолный CSV: /export"
+    return table
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
@@ -71,7 +84,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not appids:
         return
 
-    # Загружаем текущую таблицу
     games = load_existing_games()
 
     for appid in set(appids):
@@ -80,7 +92,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Не удалось получить данные для {appid}")
             continue
 
-        # Формируем строку (ссылку фиксируем)
         row = {
             "Дата обновления": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "Название": info["name"],
@@ -89,10 +100,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ссылка": f"https://store.steampowered.com/app/{appid}/"
         }
 
-        # Обновляем или добавляем запись
         games[appid] = row
-
-        # Сохраняем таблицу
         save_all_games(games)
 
         reply = (
@@ -100,20 +108,29 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Цена: {info['price']}\n"
             f"🏷 Жанры: {info['genres']}\n"
             f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>\n\n"
-            f"<i>Таблица обновлена. Всего игр: {len(games)}</i>"
+            f"<i>Таблица обновлена. Всего игр: {len(games)}</i>\n"
+            f"Показать таблицу: /таблица"
         )
         await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
+
+async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает таблицу прямо в чате"""
+    games = load_existing_games()
+    table = format_table(games)
+    await update.message.reply_text(table, parse_mode="HTML")
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not os.path.exists(CSV_FILE) or os.path.getsize(CSV_FILE) == 0:
         await update.message.reply_text("Таблица пуста")
         return
     with open(CSV_FILE, "rb") as f:
-        await update.message.reply_document(document=f, filename="steam_games.csv", caption="Сравнительная таблица")
+        await update.message.reply_document(document=f, filename="steam_games.csv", caption="CSV для Excel")
 
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    app.add_handler(CommandHandler("таблица", table_command))
+    app.add_handler(CommandHandler("table", table_command))
     app.add_handler(CommandHandler("export", export))
     webhook_url = os.environ.get("WEBHOOK_URL")
     if webhook_url:
