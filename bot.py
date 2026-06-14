@@ -65,7 +65,6 @@ def get_steam_data(appid):
             continue
     return None
 
-# ==== ПОЛНАЯ ТАБЛИЦА (карточки) ====
 def format_full_table():
     if not games:
         return "Таблица пока пуста. Киньте ссылку на игру Steam."
@@ -77,8 +76,9 @@ def format_full_table():
         price = row.get("Цена", "?")
         genres = row.get("Жанры", "?")
         desc = row.get("Описание", "—")
+        link = row.get("Ссылка", f"https://store.steampowered.com/app/{appid}/")
         block = (
-            f"🎮 <b>{name}</b>\n"
+            f'🎮 <b><a href="{link}">{name}</a></b>\n'
             f"💰 Цена: {price}\n"
             f"🏷 Жанры: {genres}\n"
             f"📝 <i>{desc}</i>"
@@ -90,27 +90,21 @@ def format_full_table():
     footer = "\n\nКороткая версия: /short"
     return header + separator.join(blocks) + footer
 
-# ==== КОРОТКАЯ ТАБЛИЦА (только название и цена) ====
 def format_short_table():
     if not games:
         return "Таблица пока пуста. Киньте ссылку на игру Steam."
 
     sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
-    lines = ["<b>📋 Краткий список</b>\n<pre>"]
-    lines.append(f"{'Название':<30} {'Цена':<15}")
-    lines.append("-" * 45)
-
+    lines = ["<b>📋 Краткий список</b>\n"]
     for appid, row in sorted_games:
-        name = row.get("Название", "?")[:29]
-        price = row.get("Цена", "?")[:14]
-        lines.append(f"{name:<30} {price:<15}")
-
-    lines.append("</pre>")
-    lines.append(f"Всего игр: {len(games)}")
+        name = row.get("Название", "?")
+        price = row.get("Цена", "?")
+        link = row.get("Ссылка", f"https://store.steampowered.com/app/{appid}/")
+        lines.append(f'• <a href="{link}">{name}</a> — {price}')
+    lines.append(f"\nВсего игр: {len(games)}")
     lines.append("Полная версия: /table")
     return "\n".join(lines)
 
-# ==== ОБРАБОТЧИКИ ====
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     pattern = r"https?://store\.steampowered\.com/app/(\d+)"
