@@ -9,14 +9,16 @@ CSV_FILE = "steam_games.csv"
 HEADERS = ["Дата обновления", "Название", "Цена (RUB)", "Жанры", "Описание", "Ссылка"]
 
 if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+    # Создаём с BOM, чтобы Excel корректно открывал русский текст
+    with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(HEADERS)
 
 def load_existing_games():
     games = {}
     if not os.path.exists(CSV_FILE):
         return games
-    with open(CSV_FILE, "r", encoding="utf-8") as f:
+    # Читаем с той же кодировкой
+    with open(CSV_FILE, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             match = re.search(r"/app/(\d+)/?", row.get("Ссылка", ""))
@@ -25,7 +27,8 @@ def load_existing_games():
     return games
 
 def save_all_games(games):
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+    # Сохраняем с BOM
+    with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=HEADERS)
         writer.writeheader()
         for appid, info in games.items():
@@ -42,18 +45,15 @@ def get_steam_data(appid):
         g = data[str(appid)]["data"]
         name = g.get("name", "Без названия")
 
-        # Цена
         price_info = g.get("price_overview")
         if price_info:
             price = f"{price_info['final']/100:.2f} ₽"
         else:
             price = "Бесплатно" if g.get("is_free") else "Нет цены"
 
-        # Жанры
         genres_list = [x["description"] for x in g.get("genres", [])]
         genres = ", ".join(genres_list) if genres_list else "Не указаны"
 
-        # Описание (короткое)
         description = g.get("short_description", "—")
 
         return {
@@ -72,7 +72,6 @@ def format_table(games):
 
     sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
     table = "<b>📊 Сравнительная таблица игр</b>\n\n<pre>"
-    # Заголовки столбцов
     table += f"{'Название':<20} {'Цена':<10} {'Жанры':<22} {'Описание':<35}\n"
     table += "-" * 87 + "\n"
 
@@ -135,8 +134,9 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not os.path.exists(CSV_FILE) or os.path.getsize(CSV_FILE) == 0:
         await update.message.reply_text("Таблица пуста")
         return
+    # Отправляем как бинарный файл (BOM внутри уже есть)
     with open(CSV_FILE, "rb") as f:
-        await update.message.reply_document(document=f, filename="steam_games.csv", caption="CSV для Excel")
+        await update.message.reply_document(document=f, filename="steam_games.csv", caption="Таблица для Excel")
 
 def main():
     app = Application.builder().token(TOKEN).build()
