@@ -54,27 +54,23 @@ def get_steam_data(appid):
         return None
 
 def format_table(games):
-    """Форматирует словарь игр в красивую текстовую таблицу"""
     if not games:
         return "Таблица пока пуста. Киньте ссылку на игру Steam."
 
-    # Сортируем по дате добавления (новые сверху)
     sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
-
-    table = "<b>📊 Сравнительная таблица игр</b>\n\n"
-    table += "<pre>"
+    table = "<b>📊 Сравнительная таблица игр</b>\n\n<pre>"
     table += f"{'Название':<25} {'Цена':<12} {'Жанры':<30}\n"
     table += "-" * 67 + "\n"
 
     for appid, row in sorted_games:
-        name = row.get("Название", "?")[:24]  # Обрезаем длинные названия
+        name = row.get("Название", "?")[:24]
         price = row.get("Цена (RUB)", "?")[:11]
         genres = row.get("Жанры", "?")[:29]
         table += f"{name:<25} {price:<12} {genres:<30}\n"
 
     table += "</pre>"
-    table += f"\nВсего игр: <b>{len(games)}</b>"
-    table += "\nПолный CSV: /export"
+    table += f"\nВсего игр: <b>{len(games)}</b>\n"
+    table += "Полный CSV: /export"
     return table
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -109,12 +105,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏷 Жанры: {info['genres']}\n"
             f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>\n\n"
             f"<i>Таблица обновлена. Всего игр: {len(games)}</i>\n"
-            f"Показать таблицу: /таблица"
+            f"Показать таблицу: /table"
         )
         await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
 
 async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает таблицу прямо в чате"""
     games = load_existing_games()
     table = format_table(games)
     await update.message.reply_text(table, parse_mode="HTML")
@@ -129,9 +124,10 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    app.add_handler(CommandHandler("таблица", table_command))
     app.add_handler(CommandHandler("table", table_command))
+    app.add_handler(CommandHandler("t", table_command))   # короткая команда
     app.add_handler(CommandHandler("export", export))
+
     webhook_url = os.environ.get("WEBHOOK_URL")
     if webhook_url:
         port = int(os.environ.get("PORT", 8443))
