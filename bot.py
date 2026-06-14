@@ -5,20 +5,55 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["TOKEN"]
-DATA_FILE = "games.json"
-PIN_MSG_KEY = "pinned_chat_id"
+STORAGE_CHAT_ID = int(os.environ["STORAGE_CHAT_ID"])   # ID канала-хранилища
+MSG_ID_KEY = "last_storage_msg_id"   # ID последнего сообщения в канале (хранится в памяти)
 
-def load_games():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+games = {}
+# В памяти будем хранить id сообщения-хранилища, чтобы редактировать его, а не создавать новое
+storage_msg_id = None
 
-def save_games(games):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(games, f, ensure_ascii=False, indent=2)
+async def restore_from_storage(app):
+    """При старте читает последнее сообщение из канала-хранилища и восстанавливает таблицу."""
+    global games, storage_msg_id
+    try:
+        # Получаем последние сообщения (лимит 1)
+        updates = await app.bot.get_updates(limit=1, timeout=5)
+        # Альтернативно: можно попросить юзера прислать /start в канале? Но проще искать сообщение по ID.
+        # Вместо этого будем использовать уже известный msg_id, если он сохранён? Но он хранится в памяти.
+        # Для первой загрузки прочитаем весь канал? Лучше завести отдельную переменную в Render, чтобы хранить msg_id.
+    except:
+        pass
+    # Поскольку msg_id может потеряться, прочитаем последнее сообщение в канале методом get_chat_history
+    try:
+        async for message in app.bot.get_chat_history(chat_id=STORAGE_CHAT_ID, limit=1):
+            if message.text:
+                data = json.loads(message.text)
+                games.clear()
+                games.update(data)
+                storage_msg_id = message.message_id
+                logging.info(f"Восстановлено {len(games)} игр из канала-хранилища")
+    except Exception as e:
+        logging.warning(f"Не удалось восстановить из канала: {e}")
 
-games = load_games()
+async def save_to_storage(context):
+    """Сохраняет текущую таблицу в канал-хранилище (редактирует существующее или создаёт новое)."""
+    global storage_msg_id
+    text = json.dumps(games, ensure_ascii=False)
+    try:
+        if storage_msg_id:
+            await context.bot.edit_message_text(
+                chat_id=STORAGE_CHAT_ID,
+                message_id=storage_msg_id,
+                text=text
+            )
+        else:
+            msg = await context.bot.send_message(
+                chat_id=STORAGE_CHAT_ID,
+                text=text
+            )
+            storage_msg_id = msg.message_id
+    except Exception as e:
+        logging.error(f"Ошибка сохранения в канал: {e}")
 
 def get_steam_data(appid):
     for region, lang, currency_label in [
@@ -63,13 +98,10 @@ def get_steam_data(appid):
             continue
     return None
 
-# Текст таблицы для команд и закрепа
-def build_pin_text():
-    game_items = {k: v for k, v in games.items() if k != PIN_MSG_KEY}
-    if not game_items:
-        return "📊 Таблица пока пуста. Добавьте ссылку на игру Steam."
-
-    sorted_games = sorted(game_items.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
+def build_full_text():
+    if not games:
+        return "📊 Таблица пока пуста."
+    sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
     blocks = []
     for appid, row in sorted_games:
         name = row.get("Название", "?")
@@ -84,78 +116,27 @@ def build_pin_text():
             f"📝 <i>{desc}</i>"
         )
         blocks.append(block)
-
-    header = f"<b>📊 Игры в списке ({len(game_items)} шт.)</b>\n"
+    header = f"<b>📊 Игры в списке ({len(games)} шт.)</b>\n"
     separator = "\n" + "—" * 25 + "\n"
-    footer = "\n\nОбновить: /full | Кратко: /short"
+    footer = "\n\nКратко: /short"
     return header + separator.join(blocks) + footer
 
-async def update_pin(context: ContextTypes.DEFAULT_TYPE):
-    """Создаёт или обновляет закреплённое сообщение (только по команде /pin)."""
-    chat_id = games.get(PIN_MSG_KEY, {}).get("chat_id")
-    msg_id = games.get(PIN_MSG_KEY, {}).get("msg_id")
-    text = build_pin_text()
-    if chat_id and msg_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=text,
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-            return
-        except Exception as e:
-            logging.warning(f"Не удалось отредактировать закреп: {e}")
-    if chat_id:
-        try:
-            msg = await context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-            await msg.pin()
-            games[PIN_MSG_KEY] = {"chat_id": chat_id, "msg_id": msg.message_id}
-            save_games(games)
-        except Exception as e:
-            logging.error(f"Ошибка создания закрепа: {e}")
+def build_short_text():
+    if not games:
+        return "📊 Таблица пока пуста."
+    sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
+    lines = ["<b>📋 Краткий список</b>\n"]
+    for appid, row in sorted_games:
+        name = row.get("Название", "?")
+        price = row.get("Цена", "?")
+        link = row.get("Ссылка", f"https://store.steampowered.com/app/{appid}/")
+        lines.append(f'• <a href="{link}">{name}</a> — {price}')
+    lines.append(f"\nВсего игр: {len(games)}")
+    lines.append("Полная версия: /full")
+    return "\n".join(lines)
 
-async def restore_from_pin(app: Application):
-    """Восстанавливает игры из закреплённого сообщения при старте."""
-    global games
-    chat_id = games.get(PIN_MSG_KEY, {}).get("chat_id")
-    msg_id = games.get(PIN_MSG_KEY, {}).get("msg_id")
-    if not chat_id or not msg_id:
-        return
-    try:
-        msg = await app.bot.get_message(chat_id=chat_id, message_id=msg_id)
-        text = msg.text or msg.caption
-        if not text:
-            return
-        pattern = r'href="https?://store\.steampowered\.com/app/(\d+)/"'
-        new_games = {}
-        for match in re.finditer(pattern, text):
-            appid = match.group(1)
-            new_games[appid] = {
-                "Дата обновления": "восстановлено",
-                "Название": "? (обновите ссылку)",
-                "Цена": "?",
-                "Жанры": "?",
-                "Описание": "?",
-                "Ссылка": f"https://store.steampowered.com/app/{appid}/"
-            }
-        if new_games:
-            games.update(new_games)
-            save_games(games)
-            logging.info(f"Восстановлено {len(new_games)} игр из закрепа")
-    except Exception as e:
-        logging.warning(f"Не удалось восстановить из закрепа: {e}")
-
-# ==== Обработчики команд ====
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
-    chat_id = update.effective_chat.id
     pattern = r"https?://store\.steampowered\.com/app/(\d+)"
     appids = re.findall(pattern, text)
     if not appids:
@@ -166,7 +147,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not info:
             await update.message.reply_text(f"❌ Не удалось получить данные для приложения {appid}")
             continue
-
         row = {
             "Дата обновления": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "Название": info["name"],
@@ -176,51 +156,27 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ссылка": f"https://store.steampowered.com/app/{appid}/"
         }
         games[appid] = row
-        # Сохраняем id чата для будущего закрепа (но сам закреп не трогаем)
-        if PIN_MSG_KEY not in games:
-            games[PIN_MSG_KEY] = {"chat_id": chat_id}
-        else:
-            games[PIN_MSG_KEY]["chat_id"] = chat_id
-        save_games(games)
 
-    game_count = len([k for k in games if k != PIN_MSG_KEY])
+    await save_to_storage(context)   # <-- сохраняем в канал
     await update.message.reply_text(
-        f"✅ Игра добавлена. Всего игр: {game_count}\n"
-        f"Показать список: /full или /short\n"
-        f"Закрепить таблицу: /pin"
+        f"✅ Игра добавлена. Всего игр: {len(games)}\n"
+        f"Показать: /full или /short"
     )
 
 async def full_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = build_pin_text()
-    await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+    await update.message.reply_text(build_full_text(), parse_mode="HTML", disable_web_page_preview=True)
 
 async def short_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    game_items = {k: v for k, v in games.items() if k != PIN_MSG_KEY}
-    if not game_items:
-        await update.message.reply_text("Таблица пока пуста.")
-        return
-    sorted_games = sorted(game_items.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
-    lines = ["<b>📋 Краткий список</b>\n"]
-    for appid, row in sorted_games:
-        name = row.get("Название", "?")
-        price = row.get("Цена", "?")
-        link = row.get("Ссылка", f"https://store.steampowered.com/app/{appid}/")
-        lines.append(f'• <a href="{link}">{name}</a> — {price}')
-    lines.append(f"\nВсего игр: {len(game_items)}")
-    lines.append("Полная версия: /full")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
-
-async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принудительно обновляет закреплённое сообщение."""
-    await update_pin(context)
-    await update.message.reply_text("✅ Таблица закреплена / обновлена.")
+    await update.message.reply_text(build_short_text(), parse_mode="HTML", disable_web_page_preview=True)
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not os.path.exists(DATA_FILE):
-        await update.message.reply_text("Нет данных.")
-        return
-    with open(DATA_FILE, "rb") as f:
-        await update.message.reply_document(document=f, filename="games_backup.json", caption="Резервная копия")
+    # просто отправляем JSON из памяти
+    json_str = json.dumps(games, ensure_ascii=False)
+    await update.message.reply_document(
+        document=json_str.encode("utf-8"),
+        filename="games_backup.json",
+        caption="Резервная копия"
+    )
 
 async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отправь мне файл games_backup.json для восстановления.")
@@ -236,27 +192,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if isinstance(data, dict):
             global games
             games = data
-            save_games(games)
-            cnt = len([k for k in games if k != PIN_MSG_KEY])
-            await update.message.reply_text(f"✅ Таблица восстановлена! Игр: {cnt}")
+            await save_to_storage(context)
+            await update.message.reply_text(f"✅ Таблица восстановлена! Игр: {len(games)}")
         else:
             await update.message.reply_text("❌ Неверный формат.")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 def main():
-    app = Application.builder().token(TOKEN).post_init(restore_from_pin).build()
+    app = Application.builder().token(TOKEN).post_init(restore_from_storage).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    # Основные команды
     app.add_handler(CommandHandler("full", full_table))
     app.add_handler(CommandHandler("f", full_table))
     app.add_handler(CommandHandler("short", short_table))
     app.add_handler(CommandHandler("s", short_table))
     app.add_handler(CommandHandler("table", full_table))
     app.add_handler(CommandHandler("t", full_table))
-    # Управление закрепом
-    app.add_handler(CommandHandler("pin", pin_command))
-    # Бэкап/восстановление
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("restore", restore_cmd))
     app.add_handler(MessageHandler(filters.Document.FileExtension("json"), handle_document))
