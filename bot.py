@@ -150,7 +150,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if new_games:
         await save_to_storage(context)
-        await update.message.reply_text(f"✅ Игры добавлены. Всего в списке: {len(games)}")
+        await update.message.reply_text(
+            f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
+            f"Посмотреть: /show"
+        )
 
 
 async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
