@@ -1,4 +1,4 @@
-import re, csv, os, logging, requests, json
+import re, csv, os, logging, requests
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -9,10 +9,9 @@ CSV_FILE = "steam_games.csv"
 
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(["Дата", "Название", "Цена (RUB)", "Жанры", "Отзывы", "Ссылка"])
+        csv.writer(f).writerow(["Дата", "Название", "Цена (RUB)", "Жанры", "Ссылка"])
 
 def get_steam_data(appid):
-    """Получает данные об игре с русским языком и ценами в рублях"""
     try:
         url = f"https://store.steampowered.com/api/appdetails?appids={appid}&cc=ru&l=russian"
         r = requests.get(url, timeout=10)
@@ -21,9 +20,6 @@ def get_steam_data(appid):
         if not data or str(appid) not in data or not data[str(appid)]["success"]:
             return None
         g = data[str(appid)]["data"]
-
-        # Для отладки выведем в логи ВСЕ поля игры (можно будет посмотреть на Render)
-        logging.info(f"Steam data for appid {appid}: {json.dumps(g, ensure_ascii=False, indent=2)}")
 
         name = g.get("name", "Без названия")
 
@@ -39,39 +35,10 @@ def get_steam_data(appid):
         genres_list = [x["description"] for x in g.get("genres", [])]
         genres = ", ".join(genres_list) if genres_list else "Не указаны"
 
-        # Отзывы: пробуем несколько вариантов
-        review_desc = g.get("review_score_desc", "")  # Например "Очень положительные"
-        if review_desc:
-            review_desc = review_desc.strip()
-
-        # Количество обзоров
-        total_reviews = g.get("total_reviews")  # Современное поле
-        if not total_reviews:
-            # Запасной вариант через recommendations
-            rec = g.get("recommendations", {})
-            if rec:
-                total_reviews = rec.get("total", 0)
-
-        # Собираем строку рейтинга
-        if total_reviews and review_desc:
-            player_rating = f"{review_desc} ({total_reviews} обз.)"
-        elif review_desc:
-            player_rating = review_desc
-        elif total_reviews:
-            # Есть количество, но нет описания (маловероятно)
-            player_rating = f"Отзывы: {total_reviews}"
-        else:
-            player_rating = "Нет оценок"
-
-        return {
-            "name": name,
-            "price": price,
-            "genres": genres,
-            "player_rating": player_rating
-        }
+        return {"name": name, "price": price, "genres": genres}
 
     except Exception as e:
-        logging.error(f"Ошибка Steam API для appid {appid}: {e}")
+        logging.error(f"Ошибка Steam API: {e}")
         return None
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -80,11 +47,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     appids = re.findall(pattern, text)
     if not appids:
         return
-
     for appid in set(appids):
         info = get_steam_data(appid)
         if not info:
-            await update.message.reply_text(f"❌ Не удалось получить данные для приложения {appid}")
+            await update.message.reply_text(f"❌ Не удалось получить данные для {appid}")
             continue
 
         row = [
@@ -92,7 +58,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info["name"],
             info["price"],
             info["genres"],
-            info["player_rating"],
             f"https://store.steampowered.com/app/{appid}/"
         ]
         with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
@@ -102,7 +67,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎮 <b>{info['name']}</b>\n"
             f"💰 Цена: {info['price']}\n"
             f"🏷 Жанры: {info['genres']}\n"
-            f"👍 Отзывы: {info['player_rating']}\n"
             f"🔗 <a href='https://store.steampowered.com/app/{appid}/'>Ссылка</a>"
         )
         await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
