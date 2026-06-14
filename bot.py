@@ -19,78 +19,168 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
-GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
+# ID канала-хранилища (обязателен для сохранения данных)
+STORAGE_CHAT_ID = int(os.environ.get("STORAGE_CHAT_ID", "0"))
+
 games: dict[str, dict] = {}
-pinned_msg_id: int | None = None
+storage_msg_ids: list[int] = []   # ID сообщений-частей в канале
+MAX_LEN = 4000                    # запас до лимита 4096
 
 
-# ── Восстановление из закрепа ──────────────────────────────
-async def restore_from_pinned(app: Application) -> None:
-    global games, pinned_msg_id
+# ── Восстановление при старте ──────────────────────────────
+async def restore_data(app: Application) -> None:
+    global games, storage_msg_ids
+
+    if not STORAGE_CHAT_ID:
+        logger.warning("STORAGE_CHAT_ID не задан – данные не будут сохранены между перезапусками")
+        return
+
     try:
         resp = requests.get(
-            f"{API_URL}/getChat",
-            params={"chat_id": GROUP_CHAT_ID},
+            f"{API_URL}/getChatHistory",
+            params={"chat_id": STORAGE_CHAT_ID, "limit": 10},
             timeout=10,
         )
         data = resp.json()
         if not data.get("ok"):
-            logger.warning("Ошибка получения чата: %s", data)
+            logger.warning("Ошибка получения истории канала: %s", data)
             return
 
-        pinned = data["result"].get("pinned_message")
-        if pinned and "text" in pinned:
-            games = json.loads(pinned["text"])
-            pinned_msg_id = pinned["message_id"]
-            logger.info("Восстановлено %d игр из закрепа", len(games))
+        messages = data["result"]["messages"]
+        if not messages:
+            logger.info("Канал-хранилище пуст")
+            return
+
+        parts = {}
+        for msg in messages:
+            text = msg.get("text", "")
+            if text.startswith("PART:"):
+                try:
+                    header, body = text.split("\n", 1)
+                    part_num, total = (int(x) for x in header[5:].split("/"))
+                    parts[part_num] = body
+                except Exception:
+                    continue
+
+        if parts:
+            sorted_parts = [parts[i] for i in sorted(parts.keys())]
+            full_json = "".join(sorted_parts)
+            games = json.loads(full_json)
+            storage_msg_ids = [
+                msg["message_id"]
+                for msg in messages
+                if msg.get("text", "").startswith("PART:")
+            ]
+            storage_msg_ids.sort()
+            logger.info("Восстановлено %d игр из канала (%d частей)", len(games), len(parts))
         else:
-            logger.info("Закреплённое сообщение не найдено")
+            # Старый формат – одно сообщение
+            first_msg = messages[0]
+            if first_msg.get("text"):
+                games = json.loads(first_msg["text"])
+                storage_msg_ids = [first_msg["message_id"]]
+                logger.info("Восстановлено %d игр (старый формат)", len(games))
     except Exception as exc:
-        logger.warning("Ошибка восстановления: %s", exc)
+        logger.warning("Ошибка восстановления из канала: %s", exc)
 
 
-async def save_to_pinned(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global pinned_msg_id
+# ── Сохранение в канал ─────────────────────────────────────
+async def save_data(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not STORAGE_CHAT_ID:
+        logger.warning("STORAGE_CHAT_ID не задан – пропускаю сохранение")
+        return
+
+    global storage_msg_ids
     text = json.dumps(games, ensure_ascii=False)
-    try:
-        if pinned_msg_id:
+
+    # Если влезает в одно сообщение
+    if len(text) <= MAX_LEN:
+        try:
+            if storage_msg_ids:
+                resp = requests.post(
+                    f"{API_URL}/editMessageText",
+                    json={
+                        "chat_id": STORAGE_CHAT_ID,
+                        "message_id": storage_msg_ids[-1],
+                        "text": text,
+                    },
+                    timeout=10,
+                )
+                if resp.json().get("ok"):
+                    # Удаляем лишние старые части
+                    for msg_id in storage_msg_ids[:-1]:
+                        requests.post(
+                            f"{API_URL}/deleteMessage",
+                            json={"chat_id": STORAGE_CHAT_ID, "message_id": msg_id},
+                            timeout=5,
+                        )
+                    storage_msg_ids = [storage_msg_ids[-1]]
+                    return
+            # Создаём новое
             resp = requests.post(
-                f"{API_URL}/editMessageText",
-                json={
-                    "chat_id": GROUP_CHAT_ID,
-                    "message_id": pinned_msg_id,
-                    "text": text,
-                },
+                f"{API_URL}/sendMessage",
+                json={"chat_id": STORAGE_CHAT_ID, "text": text},
                 timeout=10,
             )
             data = resp.json()
             if data.get("ok"):
-                return
-            else:
-                pinned_msg_id = None
+                storage_msg_ids = [data["result"]["message_id"]]
+        except Exception as exc:
+            logger.error("Ошибка сохранения: %s", exc)
+        return
 
-        # Создаём новое
-        resp = requests.post(
-            f"{API_URL}/sendMessage",
-            json={"chat_id": GROUP_CHAT_ID, "text": text},
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get("ok"):
-            new_id = data["result"]["message_id"]
-            requests.post(
-                f"{API_URL}/pinChatMessage",
-                json={"chat_id": GROUP_CHAT_ID, "message_id": new_id},
+    # ---- Многосообщенческое сохранение ----
+    parts = []
+    remaining = text
+    while remaining:
+        split_at = min(MAX_LEN, len(remaining))
+        if split_at < len(remaining):
+            last_comma = remaining.rfind(",", 0, split_at)
+            if last_comma > MAX_LEN // 2:
+                split_at = last_comma + 1
+        parts.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+
+    total = len(parts)
+    new_ids = []
+
+    for i, part in enumerate(parts, 1):
+        header = f"PART:{i}/{total}\n"
+        msg_text = header + part
+        try:
+            resp = requests.post(
+                f"{API_URL}/sendMessage",
+                json={"chat_id": STORAGE_CHAT_ID, "text": msg_text},
                 timeout=10,
             )
-            pinned_msg_id = new_id
-    except Exception as exc:
-        logger.error("Ошибка сохранения: %s", exc)
+            data = resp.json()
+            if data.get("ok"):
+                new_ids.append(data["result"]["message_id"])
+            else:
+                logger.error("Ошибка отправки части %d: %s", i, data)
+                return
+        except Exception as exc:
+            logger.error("Исключение при отправке части %d: %s", i, exc)
+            return
+
+    # Удаляем старые сообщения
+    for old_id in storage_msg_ids:
+        if old_id not in new_ids:
+            try:
+                requests.post(
+                    f"{API_URL}/deleteMessage",
+                    json={"chat_id": STORAGE_CHAT_ID, "message_id": old_id},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+    storage_msg_ids = new_ids
 
 
-# ── Steam API ───────────────────────────────────────────────
+# ── Steam API ─────────────────────────────────────────────
 def get_steam_data(appid: str) -> dict | None:
     for region, lang, currency_label in [
         ("ru", "russian", "₽"),
@@ -136,39 +226,16 @@ def get_steam_data(appid: str) -> dict | None:
     return None
 
 
-# ── Вспомогательные функции ────────────────────────────────
-def get_sorted_games():
-    """Возвращает отсортированный список (appid, данные), как в /show."""
-    return sorted(
-        games.items(),
-        key=lambda x: x[1].get("Дата", ""),
-        reverse=True,
-    )
-
-
-def find_game_by_position(pos: int) -> str | None:
-    """Находит appid по номеру позиции (начиная с 1)."""
-    sorted_games = get_sorted_games()
-    if 1 <= pos <= len(sorted_games):
-        return sorted_games[pos - 1][0]
-    return None
-
-
-def find_game_by_name(name_part: str) -> str | None:
-    """Ищет appid по части названия (первое совпадение, без учёта регистра)."""
-    name_lower = name_part.lower()
-    for appid, info in games.items():
-        if name_lower in info.get("Название", "").lower():
-            return appid
-    return None
-
-
-# ── Таблица ─────────────────────────────────────────────────
+# ── Таблица ───────────────────────────────────────────────
 def build_short_table() -> str:
     if not games:
         return "📋 Список пока пуст."
 
-    sorted_games = get_sorted_games()
+    sorted_games = sorted(
+        games.items(),
+        key=lambda x: x[1].get("Дата", ""),
+        reverse=True,
+    )
     lines = ["<b>📋 Сравнение игр</b>\n"]
     for idx, (appid, row) in enumerate(sorted_games, 1):
         name = html.escape(row.get("Название", "?"))
@@ -179,7 +246,30 @@ def build_short_table() -> str:
     return "\n".join(lines)
 
 
-# ── Обработчики ────────────────────────────────────────────
+def get_sorted_games():
+    return sorted(
+        games.items(),
+        key=lambda x: x[1].get("Дата", ""),
+        reverse=True,
+    )
+
+
+def find_game_by_position(pos: int) -> str | None:
+    sorted_games = get_sorted_games()
+    if 1 <= pos <= len(sorted_games):
+        return sorted_games[pos - 1][0]
+    return None
+
+
+def find_game_by_name(name_part: str) -> str | None:
+    name_lower = name_part.lower()
+    for appid, info in games.items():
+        if name_lower in info.get("Название", "").lower():
+            return appid
+    return None
+
+
+# ── Обработчики ──────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
     appids = set(re.findall(r"https?://store\.steampowered\.com/app/(\d+)", text))
@@ -202,7 +292,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         new_games += 1
 
     if new_games:
-        await save_to_pinned(context)
+        await save_data(context)
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
             f"Посмотреть: /show"
@@ -218,12 +308,6 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Удаление игры:
-    /delete 1          – по номеру из списка
-    /delete Hollow     – по части названия
-    /delete 730        – по appid
-    /delete <ссылка>   – по ссылке
-    """
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -234,26 +318,19 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     target = args[0]
     appid_to_delete = None
 
-    # 1. Пробуем как номер позиции (если строка состоит только из цифр и <= кол-ва игр)
     if target.isdigit():
         pos = int(target)
         if pos > 0 and pos <= len(games):
             appid_to_delete = find_game_by_position(pos)
-        if not appid_to_delete:
-            # Не номер позиции – пробуем как appid
-            if target in games:
-                appid_to_delete = target
+        if not appid_to_delete and target in games:
+            appid_to_delete = target
 
     if not appid_to_delete:
-        # 2. Ищем ссылку (вдруг скопировали ссылку целиком)
         match = re.search(r"/app/(\d+)", target)
-        if match:
-            potential_appid = match.group(1)
-            if potential_appid in games:
-                appid_to_delete = potential_appid
+        if match and match.group(1) in games:
+            appid_to_delete = match.group(1)
 
     if not appid_to_delete:
-        # 3. Поиск по названию
         appid_to_delete = find_game_by_name(target)
 
     if not appid_to_delete:
@@ -262,12 +339,11 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     name = games[appid_to_delete].get("Название", appid_to_delete)
     del games[appid_to_delete]
-    await save_to_pinned(context)
+    await save_data(context)
     await update.message.reply_text(f"🗑 Игра «{name}» удалена. Всего в списке: {len(games)}")
 
 
 async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Очистка всего списка с подтверждением."""
     args = context.args
     if not args or args[0].lower() not in ("yes", "да"):
         await update.message.reply_text("Для очистки списка введите /clear yes")
@@ -275,13 +351,13 @@ async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     count = len(games)
     games.clear()
-    await save_to_pinned(context)
+    await save_data(context)
     await update.message.reply_text(f"✅ Список очищен (удалено {count} игр)")
 
 
-# ── Запуск ─────────────────────────────────────────────────
+# ── Запуск ───────────────────────────────────────────────
 def main() -> None:
-    app = Application.builder().token(TOKEN).post_init(restore_from_pinned).build()
+    app = Application.builder().token(TOKEN).post_init(restore_data).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("show", show_table))
