@@ -1,35 +1,13 @@
-import re, csv, os, logging, requests
+import re, logging, requests
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["TOKEN"]
-CSV_FILE = "steam_games.csv"
-HEADERS = ["Дата обновления", "Название", "Цена (RUB)", "Жанры", "Описание", "Ссылка"]
 
-if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
-        csv.writer(f).writerow(HEADERS)
-
-def load_existing_games():
-    games = {}
-    if not os.path.exists(CSV_FILE):
-        return games
-    with open(CSV_FILE, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            match = re.search(r"/app/(\d+)/?", row.get("Ссылка", ""))
-            if match:
-                games[match.group(1)] = row
-    return games
-
-def save_all_games(games):
-    with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=HEADERS)
-        writer.writeheader()
-        for appid, info in games.items():
-            writer.writerow(info)
+# Хранилище игр в памяти: {appid: {данные}}
+games = {}
 
 def get_steam_data(appid):
     try:
@@ -63,13 +41,12 @@ def get_steam_data(appid):
         logging.error(f"Steam error: {e}")
         return None
 
-def format_table(games):
+def format_table():
     if not games:
         return "Таблица пока пуста. Киньте ссылку на игру Steam."
 
     sorted_games = sorted(games.items(), key=lambda x: x[1].get("Дата обновления", ""), reverse=True)
     table = "<b>📊 Сравнительная таблица игр</b>\n\n<pre>"
-    # Ширины: Название=15, Цена=8, Жанры=18, Описание=45
     table += f"{'Название':<15} {'Цена':<8} {'Жанры':<18} {'Описание':<45}\n"
     table += "-" * 86 + "\n"
 
@@ -81,8 +58,7 @@ def format_table(games):
         table += f"{name:<15} {price:<8} {genres:<18} {desc:<45}\n"
 
     table += "</pre>"
-    table += f"\nВсего игр: <b>{len(games)}</b>\n"
-    table += "Полный CSV: /export"
+    table += f"\nВсего игр: <b>{len(games)}</b>"
     return table
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -91,8 +67,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     appids = re.findall(pattern, text)
     if not appids:
         return
-
-    games = load_existing_games()
 
     for appid in set(appids):
         info = get_steam_data(appid)
@@ -110,7 +84,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         games[appid] = row
-        save_all_games(games)
 
         reply = (
             f"🎮 <b>{info['name']}</b>\n"
@@ -124,23 +97,14 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, parse_mode="HTML", disable_web_page_preview=True)
 
 async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    games = load_existing_games()
-    table = format_table(games)
+    table = format_table()
     await update.message.reply_text(table, parse_mode="HTML")
-
-async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not os.path.exists(CSV_FILE) or os.path.getsize(CSV_FILE) == 0:
-        await update.message.reply_text("Таблица пуста")
-        return
-    with open(CSV_FILE, "rb") as f:
-        await update.message.reply_document(document=f, filename="steam_games.csv", caption="Таблица для Excel")
 
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
     app.add_handler(CommandHandler("table", table_command))
     app.add_handler(CommandHandler("t", table_command))
-    app.add_handler(CommandHandler("export", export))
 
     webhook_url = os.environ.get("WEBHOOK_URL")
     if webhook_url:
