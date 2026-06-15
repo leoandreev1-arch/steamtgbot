@@ -19,43 +19,40 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
+GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-# ID канала-хранилища (обязателен для сохранения данных)
-STORAGE_CHAT_ID = int(os.environ.get("STORAGE_CHAT_ID", "0"))
-
 games: dict[str, dict] = {}
-storage_msg_ids: list[int] = []   # ID сообщений-частей в канале
-MAX_LEN = 4000                    # запас до лимита 4096
+pinned_msg_ids: list[int] = []   # ID закреплённых сообщений-частей
+MAX_LEN = 4000                   # запас до лимита 4096
 
 
 # ── Восстановление при старте ──────────────────────────────
 async def restore_data(app: Application) -> None:
-    global games, storage_msg_ids
-
-    if not STORAGE_CHAT_ID:
-        logger.warning("STORAGE_CHAT_ID не задан – данные не будут сохранены между перезапусками")
-        return
-
+    global games, pinned_msg_ids
     try:
+        # Получаем все закреплённые сообщения
         resp = requests.get(
-            f"{API_URL}/getChatHistory",
-            params={"chat_id": STORAGE_CHAT_ID, "limit": 10},
+            f"{API_URL}/getChatPinnedMessages",
+            params={"chat_id": GROUP_CHAT_ID},
             timeout=10,
         )
         data = resp.json()
         if not data.get("ok"):
-            logger.warning("Ошибка получения истории канала: %s", data)
+            logger.warning("Ошибка получения закреплённых сообщений: %s", data)
             return
 
         messages = data["result"]["messages"]
         if not messages:
-            logger.info("Канал-хранилище пуст")
+            logger.info("Нет закреплённых сообщений")
             return
 
         parts = {}
+        all_ids = []
         for msg in messages:
             text = msg.get("text", "")
+            msg_id = msg["message_id"]
+            all_ids.append(msg_id)
             if text.startswith("PART:"):
                 try:
                     header, body = text.split("\n", 1)
@@ -63,80 +60,92 @@ async def restore_data(app: Application) -> None:
                     parts[part_num] = body
                 except Exception:
                     continue
+            elif text and not text.startswith("PART:"):
+                # Возможно, старая версия – одно сообщение с JSON
+                try:
+                    games = json.loads(text)
+                    pinned_msg_ids = [msg_id]
+                    logger.info("Восстановлено %d игр (одно сообщение)", len(games))
+                    return
+                except Exception:
+                    continue
 
         if parts:
             sorted_parts = [parts[i] for i in sorted(parts.keys())]
             full_json = "".join(sorted_parts)
             games = json.loads(full_json)
-            storage_msg_ids = [
-                msg["message_id"]
-                for msg in messages
-                if msg.get("text", "").startswith("PART:")
-            ]
-            storage_msg_ids.sort()
-            logger.info("Восстановлено %d игр из канала (%d частей)", len(games), len(parts))
+            # Сохраняем ID только сообщений-частей, которые мы использовали
+            pinned_msg_ids = [mid for mid in all_ids if any(m["message_id"] == mid and m.get("text","").startswith("PART:") for m in messages)]
+            logger.info("Восстановлено %d игр из закрепа (%d частей)", len(games), len(parts))
         else:
-            # Старый формат – одно сообщение
-            first_msg = messages[0]
-            if first_msg.get("text"):
-                games = json.loads(first_msg["text"])
-                storage_msg_ids = [first_msg["message_id"]]
-                logger.info("Восстановлено %d игр (старый формат)", len(games))
+            logger.info("Закреплённые сообщения не содержат частей")
     except Exception as exc:
-        logger.warning("Ошибка восстановления из канала: %s", exc)
+        logger.warning("Ошибка восстановления: %s", exc)
 
 
-# ── Сохранение в канал ─────────────────────────────────────
+# ── Сохранение в закреп ─────────────────────────────────────
 async def save_data(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not STORAGE_CHAT_ID:
-        logger.warning("STORAGE_CHAT_ID не задан – пропускаю сохранение")
-        return
-
-    global storage_msg_ids
+    global pinned_msg_ids
     text = json.dumps(games, ensure_ascii=False)
 
     # Если влезает в одно сообщение
     if len(text) <= MAX_LEN:
         try:
-            if storage_msg_ids:
+            if pinned_msg_ids:
+                # Пробуем отредактировать последнее сообщение
                 resp = requests.post(
                     f"{API_URL}/editMessageText",
                     json={
-                        "chat_id": STORAGE_CHAT_ID,
-                        "message_id": storage_msg_ids[-1],
+                        "chat_id": GROUP_CHAT_ID,
+                        "message_id": pinned_msg_ids[-1],
                         "text": text,
                     },
                     timeout=10,
                 )
                 if resp.json().get("ok"):
-                    # Удаляем лишние старые части
-                    for msg_id in storage_msg_ids[:-1]:
+                    # Удаляем лишние старые закреплённые сообщения
+                    for old_id in pinned_msg_ids[:-1]:
                         requests.post(
                             f"{API_URL}/deleteMessage",
-                            json={"chat_id": STORAGE_CHAT_ID, "message_id": msg_id},
+                            json={"chat_id": GROUP_CHAT_ID, "message_id": old_id},
                             timeout=5,
                         )
-                    storage_msg_ids = [storage_msg_ids[-1]]
+                    pinned_msg_ids = [pinned_msg_ids[-1]]
                     return
-            # Создаём новое
+            # Иначе создаём новое и закрепляем
             resp = requests.post(
                 f"{API_URL}/sendMessage",
-                json={"chat_id": STORAGE_CHAT_ID, "text": text},
+                json={"chat_id": GROUP_CHAT_ID, "text": text},
                 timeout=10,
             )
             data = resp.json()
             if data.get("ok"):
-                storage_msg_ids = [data["result"]["message_id"]]
+                new_id = data["result"]["message_id"]
+                requests.post(
+                    f"{API_URL}/pinChatMessage",
+                    json={"chat_id": GROUP_CHAT_ID, "message_id": new_id},
+                    timeout=10,
+                )
+                # Удаляем старые закреплённые
+                for old_id in pinned_msg_ids:
+                    requests.post(
+                        f"{API_URL}/deleteMessage",
+                        json={"chat_id": GROUP_CHAT_ID, "message_id": old_id},
+                        timeout=5,
+                    )
+                pinned_msg_ids = [new_id]
         except Exception as exc:
             logger.error("Ошибка сохранения: %s", exc)
         return
 
     # ---- Многосообщенческое сохранение ----
+    # Разбиваем на части
     parts = []
     remaining = text
     while remaining:
         split_at = min(MAX_LEN, len(remaining))
         if split_at < len(remaining):
+            # Ищем последнюю запятую, чтобы не разрывать JSON посередине значения
             last_comma = remaining.rfind(",", 0, split_at)
             if last_comma > MAX_LEN // 2:
                 split_at = last_comma + 1
@@ -146,38 +155,48 @@ async def save_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     total = len(parts)
     new_ids = []
 
+    # Отправляем части и сразу закрепляем их
     for i, part in enumerate(parts, 1):
         header = f"PART:{i}/{total}\n"
         msg_text = header + part
         try:
             resp = requests.post(
                 f"{API_URL}/sendMessage",
-                json={"chat_id": STORAGE_CHAT_ID, "text": msg_text},
+                json={"chat_id": GROUP_CHAT_ID, "text": msg_text},
                 timeout=10,
             )
             data = resp.json()
-            if data.get("ok"):
-                new_ids.append(data["result"]["message_id"])
-            else:
+            if not data.get("ok"):
                 logger.error("Ошибка отправки части %d: %s", i, data)
                 return
+            new_id = data["result"]["message_id"]
+            # Закрепляем
+            pin_resp = requests.post(
+                f"{API_URL}/pinChatMessage",
+                json={"chat_id": GROUP_CHAT_ID, "message_id": new_id},
+                timeout=10,
+            )
+            if not pin_resp.json().get("ok"):
+                logger.warning("Не удалось закрепить часть %d", i)
+            new_ids.append(new_id)
         except Exception as exc:
             logger.error("Исключение при отправке части %d: %s", i, exc)
             return
 
-    # Удаляем старые сообщения
-    for old_id in storage_msg_ids:
+    # Удаляем старые закреплённые сообщения (которые теперь не нужны)
+    for old_id in pinned_msg_ids:
         if old_id not in new_ids:
             try:
                 requests.post(
                     f"{API_URL}/deleteMessage",
-                    json={"chat_id": STORAGE_CHAT_ID, "message_id": old_id},
+                    json={"chat_id": GROUP_CHAT_ID, "message_id": old_id},
                     timeout=5,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Не удалось удалить старое сообщение %d: %s", old_id, exc)
 
-    storage_msg_ids = new_ids
+    pinned_msg_ids = new_ids
+    logger.info("Данные сохранены в %d закреплённых сообщениях", total)
 
 
 # ── Steam API ─────────────────────────────────────────────
