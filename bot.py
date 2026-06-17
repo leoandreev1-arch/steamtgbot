@@ -36,36 +36,56 @@ STEAM_DELAY = 2
 
 # ═══════════════ Работа с хранилищем ═════════════════════
 def load_all_data() -> dict[str, dict]:
+    """Загружает игры из последнего валидного JSON-сообщения в канале."""
     global storage_msg_id
     try:
         resp = requests.get(
             f"{API_URL}/getChatHistory",
-            params={"chat_id": STORAGE_CHAT_ID, "limit": 1},
+            params={"chat_id": STORAGE_CHAT_ID, "limit": 5},
             timeout=10,
         )
         data = resp.json()
-        if data.get("ok") and data["result"]["messages"]:
-            msg = data["result"]["messages"][0]
+        if not data.get("ok") or not data["result"]["messages"]:
+            logger.info("Хранилище пусто")
+            return {}
+
+        # Ищем первое сообщение с валидным JSON-объектом
+        for msg in data["result"]["messages"]:
+            text = msg.get("text", "").strip()
+            if not text:
+                continue
+            try:
+                raw = json.loads(text)
+            except Exception:
+                continue
+            if not isinstance(raw, dict) or not raw:
+                continue
+
+            # Сообщение подходит
             storage_msg_id = msg["message_id"]
-            text = msg.get("text", "{}")
-            raw = json.loads(text)
-            if not raw:
-                return {}
-            # Определяем формат: плоский словарь игр (ключ – appid)
-            sample_key = next(iter(raw))
-            if sample_key.isdigit() and len(sample_key) >= 5:
-                # Плоский формат {appid: данные}
+
+            # Фильтруем служебный ключ (если есть)
+            raw.pop("pinned_chat_id", None)
+
+            # Если все ключи — числовые строки длиной от 5 символов, это плоский список игр
+            if all(isinstance(k, str) and k.isdigit() and len(k) >= 5 for k in raw):
                 return raw
-            else:
-                # Старый формат {chat_id: {appid: данные}}
-                merged = {}
-                for chat_games in raw.values():
-                    if isinstance(chat_games, dict):
-                        merged.update(chat_games)
+
+            # Иначе пробуем старый формат {chat_id: {appid: данные}}
+            merged = {}
+            for chat_games in raw.values():
+                if isinstance(chat_games, dict):
+                    for appid, info in chat_games.items():
+                        if isinstance(appid, str) and appid.isdigit() and len(appid) >= 5:
+                            merged[appid] = info
+            if merged:
                 return merged
+
+        logger.info("Не найдено подходящего JSON в хранилище")
+        return {}
     except Exception as exc:
         logger.warning("Ошибка загрузки из хранилища: %s", exc)
-    return {}
+        return {}
 
 
 def save_all_data() -> None:
@@ -431,7 +451,6 @@ async def post_init(app: Application) -> None:
     global games, storage_msg_id
     games = load_all_data()
     logger.info("Загружено %d игр из хранилища", len(games))
-    # Закреплённые таблицы не восстанавливаем при старте – они подхватятся при первом вызове /pin или добавлении игры
 
 
 def main() -> None:
