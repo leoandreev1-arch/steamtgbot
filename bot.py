@@ -49,10 +49,15 @@ def load_all_data() -> dict[str, dict]:
             storage_msg_id = msg["message_id"]
             text = msg.get("text", "{}")
             raw = json.loads(text)
-            # Если старый формат (с chat_id), объединяем все игры в один словарь
-            if raw and isinstance(next(iter(raw.values())), dict) and not any(k.isdigit() and len(k) > 3 for k in raw):
+            if not raw:
+                return {}
+            # Определяем формат: плоский словарь игр (ключ – appid)
+            sample_key = next(iter(raw))
+            if sample_key.isdigit() and len(sample_key) >= 5:
+                # Плоский формат {appid: данные}
                 return raw
             else:
+                # Старый формат {chat_id: {appid: данные}}
                 merged = {}
                 for chat_games in raw.values():
                     if isinstance(chat_games, dict):
@@ -275,15 +280,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         prices_changed = update_prices_for_all()
         if prices_changed:
             save_all_data()
-        # Обновляем закреп в том чате, где была добавлена игра
         await update_pinned_if_exists(chat_id, context)
-        # Обновим закреп и во всех других чатах, где он есть
         for cid in list(pinned_messages.keys()):
             if cid != chat_id:
                 await update_pinned_if_exists(cid, context)
-        # Ставим реакцию 👌 вместо текста
         set_reaction(chat_id, message_id, "👌")
-    # Если ни одной новой игры не добавилось, ничего не делаем
 
 
 async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -430,24 +431,7 @@ async def post_init(app: Application) -> None:
     global games, storage_msg_id
     games = load_all_data()
     logger.info("Загружено %d игр из хранилища", len(games))
-
-    # Восстанавливаем ID закреплённых таблиц во всех известных чатах
-    for chat_id_str in games:
-        try:
-            chat_id = int(chat_id_str) if chat_id_str.isdigit() else None
-            if chat_id:
-                resp = requests.get(
-                    f"{API_URL}/getChat",
-                    params={"chat_id": chat_id},
-                    timeout=10,
-                )
-                data = resp.json()
-                if data.get("ok"):
-                    pinned = data["result"].get("pinned_message")
-                    if pinned and "text" in pinned and "<b>📋 Сравнение игр</b>" in pinned["text"]:
-                        pinned_messages[chat_id] = pinned["message_id"]
-        except Exception:
-            pass
+    # Закреплённые таблицы не восстанавливаем при старте – они подхватятся при первом вызове /pin или добавлении игры
 
 
 def main() -> None:
