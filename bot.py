@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
-STORAGE_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # твоя переменная – это хранилище
+STORAGE_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # используем GROUP_CHAT_ID как хранилище
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 # Данные всех чатов: { chat_id: { appid: {...} } }
@@ -57,11 +57,9 @@ def load_all_data() -> dict[str, dict[str, dict]]:
 
 def save_all_data() -> None:
     global storage_msg_id
-    # Компактный JSON: без пробелов после ',' и ':'
     text = json.dumps(all_games, ensure_ascii=False, separators=(',', ':'))
     try:
         if storage_msg_id:
-            # Пробуем редактировать известное сообщение
             resp = requests.post(
                 f"{API_URL}/editMessageText",
                 json={
@@ -73,10 +71,8 @@ def save_all_data() -> None:
             )
             if resp.json().get("ok"):
                 return
-            # Если не получилось – сбросим ID и создадим новое
             storage_msg_id = None
 
-        # Создаём новое сообщение и запоминаем его ID
         resp = requests.post(
             f"{API_URL}/sendMessage",
             json={"chat_id": STORAGE_CHAT_ID, "text": text},
@@ -173,22 +169,49 @@ def find_game_by_name(games: dict[str, dict], name_part: str) -> str | None:
 
 
 async def update_pinned_if_exists(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Если в этом чате есть закреплённая таблица, обновляет её."""
-    if chat_id not in pinned_messages:
-        return
-    games = all_games.get(str(chat_id), {})
-    table = build_short_table(games)
+    """Обновляет закреплённую таблицу, если она есть. Если нет – ничего не делает."""
+    # Сначала попробуем найти закреплённую таблицу по ID (если известен)
+    pinned_id = pinned_messages.get(chat_id)
+    if pinned_id:
+        try:
+            games = all_games.get(str(chat_id), {})
+            table = build_short_table(games)
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=pinned_id,
+                text=table,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception:
+            # Если не получилось отредактировать (например, сообщение удалено), сбрасываем ID и пробуем найти новое
+            pinned_messages.pop(chat_id, None)
+
+    # Попробуем найти любое закреплённое сообщение с таблицей в этом чате
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=pinned_messages[chat_id],
-            text=table,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+        resp = requests.get(
+            f"{API_URL}/getChat",
+            params={"chat_id": chat_id},
+            timeout=10,
         )
-    except Exception as exc:
-        logger.error("Ошибка обновления закреплённой таблицы в чате %d: %s", chat_id, exc)
-        pinned_messages.pop(chat_id, None)
+        data = resp.json()
+        if data.get("ok"):
+            pinned = data["result"].get("pinned_message")
+            if pinned and "text" in pinned and "📋 Сравнение игр" in pinned["text"]:
+                # Нашли таблицу – обновим её
+                games = all_games.get(str(chat_id), {})
+                table = build_short_table(games)
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=pinned["message_id"],
+                    text=table,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                pinned_messages[chat_id] = pinned["message_id"]
+    except Exception:
+        pass
 
 
 # ═══════════════ Обработчики команд ══════════════════════
@@ -219,10 +242,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if new_games:
         save_all_data()
         await update_pinned_if_exists(chat_id, context)
+        # Только короткий ответ – без /show и /pin
         await update.message.reply_text(
-            f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
-            f"Посмотреть: /show\n"
-            f"Закрепить таблицу: /pin"
+            f"✅ Игры добавлены. Всего в списке: {len(games)}"
         )
 
 
@@ -239,12 +261,28 @@ async def pin_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     games = all_games.get(str(chat_id), {})
     table = build_short_table(games)
 
-    current_pinned = pinned_messages.get(chat_id)
+    # Попробуем обновить существующую, ища её через API, если ID неизвестен
+    if chat_id not in pinned_messages:
+        try:
+            resp = requests.get(
+                f"{API_URL}/getChat",
+                params={"chat_id": chat_id},
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("ok"):
+                pinned = data["result"].get("pinned_message")
+                if pinned and "text" in pinned and "📋 Сравнение игр" in pinned["text"]:
+                    pinned_messages[chat_id] = pinned["message_id"]
+        except Exception:
+            pass
+
+    pinned_id = pinned_messages.get(chat_id)
     try:
-        if current_pinned:
+        if pinned_id:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
-                message_id=current_pinned,
+                message_id=pinned_id,
                 text=table,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
@@ -360,7 +398,7 @@ async def post_init(app: Application) -> None:
     all_games = load_all_data()
     logger.info("Загружено %d чатов из хранилища", len(all_games))
 
-    # Попытаемся найти уже существующие закреплённые таблицы во всех чатах
+    # Восстанавливаем ID закреплённых таблиц, если они есть
     for chat_id_str in all_games:
         try:
             chat_id = int(chat_id_str)
