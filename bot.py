@@ -19,12 +19,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
-GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # ID твоей группы
+GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 games: dict[str, dict] = {}
 pinned_msg_id: int | None = None
 
+# Короткие ключи для экономии места
 KEY_DATE = "д"
 KEY_NAME = "н"
 KEY_PRICE = "ц"
@@ -93,7 +94,7 @@ async def save_to_pinned(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("Ошибка сохранения: %s", exc)
 
 
-# ── Реакция 👌 на сообщение ──────────────────────────────
+# ── Реакция на сообщение ──────────────────────────────────
 def set_reaction(chat_id: int, message_id: int, emoji: str = "👌") -> None:
     try:
         requests.post(
@@ -231,23 +232,22 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def pin_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Создаёт или обновляет закреплённую таблицу в группе."""
+    global pinned_msg_id               # <-- исправлено!
     table = build_short_table()
     try:
-        # Пробуем отредактировать текущий закреп
         if pinned_msg_id:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=GROUP_CHAT_ID,
-                    message_id=pinned_msg_id,
-                    text=table,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-                await update.message.reply_text("✅ Таблица обновлена в закрепе.")
-                return
-            except Exception:
-                # Если не получилось отредактировать, создаём новое
-                pinned_msg_id = None
+            # Пробуем отредактировать текущий закреп
+            await context.bot.edit_message_text(
+                chat_id=GROUP_CHAT_ID,
+                message_id=pinned_msg_id,
+                text=table,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            await update.message.reply_text("✅ Таблица обновлена в закрепе.")
+            return
+        except Exception:
+            pinned_msg_id = None
 
         # Создаём новое и закрепляем
         msg = await context.bot.send_message(
