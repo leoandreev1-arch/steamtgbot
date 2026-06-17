@@ -26,6 +26,8 @@ API_URL = f"https://api.telegram.org/bot{TOKEN}"
 all_games: dict[str, dict[str, dict]] = {}
 # ID закреплённых таблиц: { chat_id: message_id }
 pinned_messages: dict[int, int] = {}
+# ID сообщения в хранилище (редактируем его, а не создаём новое)
+storage_msg_id: int | None = None
 
 KEY_DATE = "д"
 KEY_NAME = "н"
@@ -35,6 +37,7 @@ ESTIMATED_BYTES_PER_GAME = 150
 
 # ═══════════════ Работа с хранилищем ═════════════════════
 def load_all_data() -> dict[str, dict[str, dict]]:
+    global storage_msg_id
     try:
         resp = requests.get(
             f"{API_URL}/getChatHistory",
@@ -43,7 +46,9 @@ def load_all_data() -> dict[str, dict[str, dict]]:
         )
         data = resp.json()
         if data.get("ok") and data["result"]["messages"]:
-            text = data["result"]["messages"][0].get("text", "{}")
+            msg = data["result"]["messages"][0]
+            storage_msg_id = msg["message_id"]
+            text = msg.get("text", "{}")
             return json.loads(text)
     except Exception as exc:
         logger.warning("Ошибка загрузки из хранилища: %s", exc)
@@ -51,31 +56,34 @@ def load_all_data() -> dict[str, dict[str, dict]]:
 
 
 def save_all_data() -> None:
+    global storage_msg_id
     text = json.dumps(all_games, ensure_ascii=False)
     try:
-        resp = requests.get(
-            f"{API_URL}/getChatHistory",
-            params={"chat_id": STORAGE_CHAT_ID, "limit": 1},
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get("ok") and data["result"]["messages"]:
-            last_msg_id = data["result"]["messages"][0]["message_id"]
-            requests.post(
+        if storage_msg_id:
+            # Пробуем редактировать известное сообщение
+            resp = requests.post(
                 f"{API_URL}/editMessageText",
                 json={
                     "chat_id": STORAGE_CHAT_ID,
-                    "message_id": last_msg_id,
+                    "message_id": storage_msg_id,
                     "text": text,
                 },
                 timeout=10,
             )
-        else:
-            requests.post(
-                f"{API_URL}/sendMessage",
-                json={"chat_id": STORAGE_CHAT_ID, "text": text},
-                timeout=10,
-            )
+            if resp.json().get("ok"):
+                return
+            # Если не получилось – сбросим ID и создадим новое
+            storage_msg_id = None
+
+        # Создаём новое сообщение и запоминаем его ID
+        resp = requests.post(
+            f"{API_URL}/sendMessage",
+            json={"chat_id": STORAGE_CHAT_ID, "text": text},
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("ok"):
+            storage_msg_id = data["result"]["message_id"]
     except Exception as exc:
         logger.error("Ошибка сохранения в хранилище: %s", exc)
 
@@ -209,7 +217,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if new_games:
         save_all_data()
-        # Автоматически обновляем закреплённую таблицу, если она есть
         await update_pinned_if_exists(chat_id, context)
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
@@ -348,7 +355,7 @@ async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ═══════════════ Запуск ══════════════════════════════════
 async def post_init(app: Application) -> None:
-    global all_games
+    global all_games, storage_msg_id
     all_games = load_all_data()
     logger.info("Загружено %d чатов из хранилища", len(all_games))
 
