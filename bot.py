@@ -29,7 +29,7 @@ pinned_msg_id: int | None = None
 KEY_DATE = "д"
 KEY_NAME = "н"
 KEY_PRICE = "ц"
-ESTIMATED_BYTES_PER_GAME = 150  # оценка с короткими ключами
+ESTIMATED_BYTES_PER_GAME = 150
 
 
 # ── Восстановление из закрепа ──────────────────────────────
@@ -126,10 +126,7 @@ def get_steam_data(appid: str) -> dict | None:
             else:
                 price = "Нет цены"
 
-            return {
-                "name": name,
-                "price": price,
-            }
+            return {"name": name, "price": price}
         except Exception:
             continue
     return None
@@ -192,7 +189,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if info is None:
             await update.message.reply_text(f"❌ Не удалось найти данные об игре {appid}")
             continue
-        # ✅ Используем короткие ключи
         games[appid] = {
             KEY_DATE: datetime.now().strftime("%Y-%m-%d %H:%M"),
             KEY_NAME: info["name"],
@@ -224,15 +220,12 @@ async def show_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     sample_json = json.dumps(games, ensure_ascii=False)
     current_bytes = len(sample_json.encode("utf-8"))
-    max_bytes = 4000
-    remaining_games = max(0, (max_bytes - current_bytes) // ESTIMATED_BYTES_PER_GAME)
+    remaining_games = max(0, (4000 - current_bytes) // ESTIMATED_BYTES_PER_GAME)
 
     lines = [
         f"📊 Игр в списке: <b>{total_games}</b>",
-        f"📦 Занято: ~{current_bytes} / {max_bytes} символов",
+        f"📦 Занято: ~{current_bytes} / 4000 символов",
         f"➕ Ещё влезет: <b>~{remaining_games} игр</b>",
-        "",
-        "При превышении лимита бот создаст второе закреплённое сообщение.",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
