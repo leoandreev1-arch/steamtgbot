@@ -46,7 +46,7 @@ def load_all_data() -> dict[str, dict[str, dict]]:
         data = resp.json()
         if data.get("ok") and data["result"]["messages"]:
             msg = data["result"]["messages"][0]
-            storage_msg_id = msg["message_id"]
+            storage_msg_id = msg["message_id"]          # запоминаем ID последнего сообщения
             text = msg.get("text", "{}")
             return json.loads(text)
     except Exception as exc:
@@ -59,6 +59,7 @@ def save_all_data() -> None:
     text = json.dumps(all_games, ensure_ascii=False, separators=(',', ':'))
     try:
         if storage_msg_id:
+            # Пробуем отредактировать известное сообщение
             resp = requests.post(
                 f"{API_URL}/editMessageText",
                 json={
@@ -70,8 +71,15 @@ def save_all_data() -> None:
             )
             if resp.json().get("ok"):
                 return
+            # Если не удалось отредактировать (устарело, удалено) – удаляем его и создаём новое
+            requests.post(
+                f"{API_URL}/deleteMessage",
+                json={"chat_id": STORAGE_CHAT_ID, "message_id": storage_msg_id},
+                timeout=5,
+            )
             storage_msg_id = None
 
+        # Создаём новое сообщение и запоминаем его ID
         resp = requests.post(
             f"{API_URL}/sendMessage",
             json={"chat_id": STORAGE_CHAT_ID, "text": text},
@@ -147,7 +155,6 @@ def update_prices_for_chat(games: dict[str, dict]) -> bool:
     changed = False
     for appid, info in games.items():
         try:
-            # Пауза перед каждым запросом (кроме первого)
             if appid != next(iter(games)):
                 time.sleep(STEAM_DELAY)
             fresh = get_steam_data(appid)
@@ -155,7 +162,6 @@ def update_prices_for_chat(games: dict[str, dict]) -> bool:
                 info[KEY_PRICE] = fresh["price"]
                 changed = True
         except Exception:
-            # Игнорируем ошибки, чтобы не потерять игру
             continue
     return changed
 
@@ -253,13 +259,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if new_games:
         save_all_data()
-        # Обновляем цены всех игр в этом чате (тихо)
         update_prices_for_chat(games)
         save_all_data()
-
         await update_pinned_if_exists(chat_id, context)
-
-        # Только короткий ответ
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}"
         )
