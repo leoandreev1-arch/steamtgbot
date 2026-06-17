@@ -23,7 +23,7 @@ TOKEN = os.environ["TOKEN"]
 STORAGE_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # твоя переменная – это хранилище
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-games: dict[str, dict] = {}           # единый список игр: { appid: {...} }
+games: dict[str, dict] = {}           # единый список игр
 pinned_messages: dict[int, int] = {}  # ID закреплённых таблиц по chat_id
 storage_msg_id: int | None = None
 
@@ -51,10 +51,8 @@ def load_all_data() -> dict[str, dict]:
             raw = json.loads(text)
             # Если старый формат (с chat_id), объединяем все игры в один словарь
             if raw and isinstance(next(iter(raw.values())), dict) and not any(k.isdigit() and len(k) > 3 for k in raw):
-                # Похоже на плоский словарь appid → данные
                 return raw
             else:
-                # Старый формат { chat_id: { appid: {...} } }
                 merged = {}
                 for chat_games in raw.values():
                     if isinstance(chat_games, dict):
@@ -92,6 +90,23 @@ def save_all_data() -> None:
             storage_msg_id = data["result"]["message_id"]
     except Exception as exc:
         logger.error("Ошибка сохранения: %s", exc)
+
+
+# ═══════════════ Установка реакции ══════════════════════
+def set_reaction(chat_id: int, message_id: int, emoji: str) -> None:
+    """Ставит реакцию на сообщение."""
+    try:
+        requests.post(
+            f"{API_URL}/setMessageReaction",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reaction": [{"type": "emoji", "emoji": emoji}]
+            },
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.error("Ошибка установки реакции: %s", exc)
 
 
 # ═══════════════ Таблица (общая для всех чатов) ═════════════
@@ -210,7 +225,6 @@ async def update_pinned_if_exists(chat_id: int, context: ContextTypes.DEFAULT_TY
         except Exception:
             pinned_messages.pop(chat_id, None)
 
-    # Попробуем найти таблицу в закрепе этого чата
     try:
         resp = requests.get(
             f"{API_URL}/getChat",
@@ -237,6 +251,7 @@ async def update_pinned_if_exists(chat_id: int, context: ContextTypes.DEFAULT_TY
 # ═══════════════ Обработчики команд ══════════════════════
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    message_id = update.effective_message.message_id
     text = update.message.text or ""
     appids = set(re.findall(r"https?://store\.steampowered\.com/app/(\d+)", text))
     if not appids:
@@ -257,19 +272,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if new_games:
         save_all_data()
-        # Обновляем цены всех игр
         prices_changed = update_prices_for_all()
         if prices_changed:
             save_all_data()
-        # Обновляем закреп в том чате, где была добавлена игра (если был /pin)
+        # Обновляем закреп в том чате, где была добавлена игра
         await update_pinned_if_exists(chat_id, context)
-        # Также обновим во всех остальных чатах, где есть закреп
+        # Обновим закреп и во всех других чатах, где он есть
         for cid in list(pinned_messages.keys()):
             if cid != chat_id:
                 await update_pinned_if_exists(cid, context)
-        await update.message.reply_text(
-            f"✅ Игры добавлены. Всего в списке: {len(games)}"
-        )
+        # Ставим реакцию 👌 вместо текста
+        set_reaction(chat_id, message_id, "👌")
+    # Если ни одной новой игры не добавилось, ничего не делаем
 
 
 async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -392,7 +406,6 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     name = games[appid_to_delete].get(KEY_NAME, appid_to_delete)
     del games[appid_to_delete]
     save_all_data()
-    # Обновляем закреп во всех чатах, где он есть
     for cid in list(pinned_messages.keys()):
         await update_pinned_if_exists(cid, context)
     await update.message.reply_text(f"🗑 Игра «{name}» удалена. Всего в списке: {len(games)}")
