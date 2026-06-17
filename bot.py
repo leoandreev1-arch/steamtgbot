@@ -20,10 +20,11 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
 GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])
+STORAGE_CHAT_ID = int(os.environ["STORAGE_CHAT_ID"])
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 games: dict[str, dict] = {}
-pinned_msg_id: int | None = None
+pinned_msg_id: int | None = None        # ID закреплённой таблицы (если создана через /pin)
 
 KEY_DATE = "д"
 KEY_NAME = "н"
@@ -31,78 +32,61 @@ KEY_PRICE = "ц"
 ESTIMATED_BYTES_PER_GAME = 150
 
 
-# ── Восстановление из закрепа ──────────────────────────────
-async def restore_from_pinned(app: Application) -> None:
-    global games, pinned_msg_id
+# ── Работа с каналом-хранилищем ──────────────────────────
+def load_games() -> dict[str, dict]:
     try:
         resp = requests.get(
-            f"{API_URL}/getChat",
-            params={"chat_id": GROUP_CHAT_ID},
+            f"{API_URL}/getChatHistory",
+            params={"chat_id": STORAGE_CHAT_ID, "limit": 1},
             timeout=10,
         )
         data = resp.json()
-        if not data.get("ok"):
-            logger.warning("Ошибка получения чата: %s", data)
-            return
-
-        pinned = data["result"].get("pinned_message")
-        if pinned and "text" in pinned:
-            games = json.loads(pinned["text"])
-            pinned_msg_id = pinned["message_id"]
-            logger.info("Восстановлено %d игр из закрепа", len(games))
-        else:
-            logger.info("Закреплённое сообщение не найдено")
+        if data.get("ok") and data["result"]["messages"]:
+            text = data["result"]["messages"][0].get("text", "{}")
+            all_data = json.loads(text)
+            return all_data.get(str(GROUP_CHAT_ID), {})
     except Exception as exc:
-        logger.warning("Ошибка восстановления: %s", exc)
+        logger.warning("Ошибка загрузки: %s", exc)
+    return {}
 
 
-# ── Обновление закреплённой таблицы ────────────────────────
-async def update_pinned_table(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global pinned_msg_id
-    table_text = build_short_table()
+def save_games(games: dict[str, dict]) -> None:
     try:
-        if pinned_msg_id:
-            await context.bot.edit_message_text(
-                chat_id=GROUP_CHAT_ID,
-                message_id=pinned_msg_id,
-                text=table_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
+        resp = requests.get(
+            f"{API_URL}/getChatHistory",
+            params={"chat_id": STORAGE_CHAT_ID, "limit": 1},
+            timeout=10,
+        )
+        data = resp.json()
+        all_data = {}
+        if data.get("ok") and data["result"]["messages"]:
+            try:
+                all_data = json.loads(data["result"]["messages"][0].get("text", "{}"))
+            except Exception:
+                pass
+
+        all_data[str(GROUP_CHAT_ID)] = games
+        text = json.dumps(all_data, ensure_ascii=False)
+
+        if data.get("ok") and data["result"]["messages"]:
+            last_msg_id = data["result"]["messages"][0]["message_id"]
+            requests.post(
+                f"{API_URL}/editMessageText",
+                json={
+                    "chat_id": STORAGE_CHAT_ID,
+                    "message_id": last_msg_id,
+                    "text": text,
+                },
+                timeout=10,
             )
         else:
-            msg = await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=table_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
+            requests.post(
+                f"{API_URL}/sendMessage",
+                json={"chat_id": STORAGE_CHAT_ID, "text": text},
+                timeout=10,
             )
-            await msg.pin()
-            pinned_msg_id = msg.message_id
     except Exception as exc:
-        logger.error("Ошибка обновления закрепа: %s", exc)
-        pinned_msg_id = None
-
-
-# ── Сохранение JSON в закреп ───────────────────────────────
-async def save_json_to_pinned(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global pinned_msg_id
-    text = json.dumps(games, ensure_ascii=False)
-    try:
-        if pinned_msg_id:
-            await context.bot.edit_message_text(
-                chat_id=GROUP_CHAT_ID,
-                message_id=pinned_msg_id,
-                text=text,
-            )
-        else:
-            msg = await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=text,
-            )
-            await msg.pin()
-            pinned_msg_id = msg.message_id
-    except Exception as exc:
-        logger.error("Ошибка сохранения JSON в закреп: %s", exc)
+        logger.error("Ошибка сохранения: %s", exc)
 
 
 # ── Steam API ─────────────────────────────────────────────
@@ -187,7 +171,7 @@ def find_game_by_name(name_part: str) -> str | None:
     return None
 
 
-# ── Обработчики ──────────────────────────────────────────
+# ── Обработчики команд ───────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
     appids = set(re.findall(r"https?://store\.steampowered\.com/app/(\d+)", text))
@@ -208,17 +192,65 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         new_games += 1
 
     if new_games:
-        await save_json_to_pinned(context)          # сохраняем JSON
-        await update_pinned_table(context)           # заменяем закреп на красивую таблицу
+        save_games(games)
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
-            f"Таблица в закрепе обновлена."
+            f"Посмотреть: /show\n"
+            f"Закрепить таблицу: /pin"
         )
 
 
 async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update_pinned_table(context)
-    await update.message.reply_text("✅ Закреплённая таблица обновлена.")
+    await update.message.reply_text(
+        build_short_table(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def pin_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Создаёт или обновляет закреплённую таблицу."""
+    global pinned_msg_id
+    table = build_short_table()
+
+    try:
+        if pinned_msg_id:
+            await context.bot.edit_message_text(
+                chat_id=GROUP_CHAT_ID,
+                message_id=pinned_msg_id,
+                text=table,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        else:
+            msg = await context.bot.send_message(
+                chat_id=GROUP_CHAT_ID,
+                text=table,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            await msg.pin()
+            pinned_msg_id = msg.message_id
+        await update.message.reply_text("✅ Таблица закреплена.")
+    except Exception as exc:
+        logger.error("Ошибка закрепления: %s", exc)
+        pinned_msg_id = None
+        await update.message.reply_text("❌ Не удалось закрепить таблицу. Проверьте права бота.")
+
+
+async def unpin_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Открепляет таблицу, если она есть."""
+    global pinned_msg_id
+    if not pinned_msg_id:
+        await update.message.reply_text("Закреплённой таблицы нет.")
+        return
+    try:
+        await context.bot.unpin_chat_message(chat_id=GROUP_CHAT_ID, message_id=pinned_msg_id)
+        pinned_msg_id = None
+        await update.message.reply_text("✅ Закреплённая таблица удалена.")
+    except Exception as exc:
+        logger.error("Ошибка открепления: %s", exc)
+        await update.message.reply_text("❌ Не удалось открепить таблицу.")
 
 
 async def show_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -271,8 +303,12 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     name = games[appid_to_delete].get(KEY_NAME, games[appid_to_delete].get("Название", appid_to_delete))
     del games[appid_to_delete]
-    await save_json_to_pinned(context)
-    await update_pinned_table(context)
+    save_games(games)
+
+    # Если закреплённая таблица есть – обновляем её автоматически
+    if pinned_msg_id:
+        await update_pinned_if_exists(context)
+
     await update.message.reply_text(f"🗑 Игра «{name}» удалена. Всего в списке: {len(games)}")
 
 
@@ -284,18 +320,64 @@ async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     count = len(games)
     games.clear()
-    await save_json_to_pinned(context)
-    await update_pinned_table(context)
+    save_games(games)
+
+    if pinned_msg_id:
+        await update_pinned_if_exists(context)
+
     await update.message.reply_text(f"✅ Список очищен (удалено {count} игр)")
 
 
+async def update_pinned_if_exists(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Вспомогательная функция – обновляет закреплённую таблицу, если она была создана."""
+    global pinned_msg_id
+    if not pinned_msg_id:
+        return
+    table = build_short_table()
+    try:
+        await context.bot.edit_message_text(
+            chat_id=GROUP_CHAT_ID,
+            message_id=pinned_msg_id,
+            text=table,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.error("Ошибка обновления закреплённой таблицы: %s", exc)
+        pinned_msg_id = None
+
+
 # ── Запуск ───────────────────────────────────────────────
+async def post_init(app: Application) -> None:
+    global games, pinned_msg_id
+    games = load_games()
+    logger.info("Загружено %d игр из хранилища", len(games))
+
+    # Попытаемся найти уже существующее закреплённое сообщение с таблицей
+    try:
+        resp = requests.get(
+            f"{API_URL}/getChat",
+            params={"chat_id": GROUP_CHAT_ID},
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("ok"):
+            pinned = data["result"].get("pinned_message")
+            if pinned and "text" in pinned and "<b>📋 Сравнение игр</b>" in pinned["text"]:
+                pinned_msg_id = pinned["message_id"]
+                logger.info("Найдена закреплённая таблица (id=%d)", pinned_msg_id)
+    except Exception:
+        pass
+
+
 def main() -> None:
-    app = Application.builder().token(TOKEN).post_init(restore_from_pinned).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("show", show_table))
     app.add_handler(CommandHandler("s", show_table))
+    app.add_handler(CommandHandler("pin", pin_table))
+    app.add_handler(CommandHandler("unpin", unpin_table))
     app.add_handler(CommandHandler("limit", show_limit))
     app.add_handler(CommandHandler("delete", delete_game))
     app.add_handler(CommandHandler("d", delete_game))
