@@ -30,7 +30,6 @@ MAX_LEN = 4000                   # запас до лимита 4096
 KEY_DATE = "д"
 KEY_NAME = "н"
 KEY_PRICE = "ц"
-ESTIMATED_BYTES_PER_GAME = 300  # реалистичная верхняя граница
 
 
 # ── Восстановление из закрепа ──────────────────────────────
@@ -65,6 +64,7 @@ async def restore_data(app: Application) -> None:
                 except Exception:
                     continue
             elif text:
+                # Возможно, старая одиночная версия
                 single_candidate = text
 
         if parts:
@@ -74,6 +74,7 @@ async def restore_data(app: Application) -> None:
             pinned_msg_ids = [m["message_id"] for m in messages if m.get("text", "").startswith("PART:")]
             logger.info("Восстановлено %d игр из закрепа (%d частей)", len(games), len(parts))
         elif single_candidate:
+            # Старая одиночная версия
             try:
                 games = json.loads(single_candidate)
                 pinned_msg_ids = [messages[-1]["message_id"]]
@@ -83,14 +84,17 @@ async def restore_data(app: Application) -> None:
         else:
             logger.info("Закреплённые сообщения не содержат данных")
 
+        # Конвертируем старые длинные ключи в новые короткие, если нужно
         convert_old_keys()
     except Exception as exc:
         logger.warning("Ошибка восстановления: %s", exc)
 
 
 def convert_old_keys() -> None:
+    """Преобразует старые длинные ключи в новые короткие."""
     changed = False
     for appid, info in games.items():
+        # Проверяем, есть ли старые ключи
         if "Название" in info and KEY_NAME not in info:
             info[KEY_NAME] = info.pop("Название")
             changed = True
@@ -100,6 +104,7 @@ def convert_old_keys() -> None:
         if "Дата" in info and KEY_DATE not in info:
             info[KEY_DATE] = info.pop("Дата")
             changed = True
+        # Удаляем больше не нужные ключи
         for old_key in ("Жанры", "Ссылка"):
             info.pop(old_key, None)
     if changed:
@@ -111,9 +116,11 @@ async def save_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     global pinned_msg_ids
     text = json.dumps(games, ensure_ascii=False)
 
+    # Если влезает в одно сообщение
     if len(text) <= MAX_LEN:
         try:
             if pinned_msg_ids:
+                # Пробуем отредактировать последнее
                 resp = requests.post(
                     f"{API_URL}/editMessageText",
                     json={
@@ -124,6 +131,7 @@ async def save_data(context: ContextTypes.DEFAULT_TYPE) -> None:
                     timeout=10,
                 )
                 if resp.json().get("ok"):
+                    # Удаляем лишние старые закреплённые
                     for old_id in pinned_msg_ids[:-1]:
                         requests.post(
                             f"{API_URL}/deleteMessage",
@@ -132,6 +140,7 @@ async def save_data(context: ContextTypes.DEFAULT_TYPE) -> None:
                         )
                     pinned_msg_ids = [pinned_msg_ids[-1]]
                     return
+            # Создаём новое и закрепляем
             resp = requests.post(
                 f"{API_URL}/sendMessage",
                 json={"chat_id": GROUP_CHAT_ID, "text": text},
@@ -145,6 +154,7 @@ async def save_data(context: ContextTypes.DEFAULT_TYPE) -> None:
                     json={"chat_id": GROUP_CHAT_ID, "message_id": new_id},
                     timeout=10,
                 )
+                # Удаляем все старые закреплённые
                 for old_id in pinned_msg_ids:
                     requests.post(
                         f"{API_URL}/deleteMessage",
@@ -156,12 +166,13 @@ async def save_data(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.error("Ошибка сохранения: %s", exc)
         return
 
-    # Многосообщенческое сохранение
+    # ---- Многосообщенческое сохранение ----
     parts = []
     remaining = text
     while remaining:
         split_at = min(MAX_LEN, len(remaining))
         if split_at < len(remaining):
+            # Ищем безопасное место для разрыва (после запятой)
             last_comma = remaining.rfind(",", 0, split_at)
             if last_comma > MAX_LEN // 2:
                 split_at = last_comma + 1
@@ -195,6 +206,7 @@ async def save_data(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.error("Исключение при отправке части %d: %s", i, exc)
             return
 
+    # Удаляем старые закреплённые сообщения
     for old_id in pinned_msg_ids:
         if old_id not in new_ids:
             try:
@@ -242,6 +254,7 @@ def get_steam_data(appid: str) -> dict | None:
             else:
                 price = "Нет цены"
 
+            # Жанры не сохраняем, они не используются в /show
             return {
                 "name": name,
                 "price": price,
@@ -307,6 +320,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if info is None:
             await update.message.reply_text(f"❌ Не удалось найти данные об игре {appid}")
             continue
+        # Сохраняем только короткие ключи
         games[appid] = {
             KEY_DATE: datetime.now().strftime("%Y-%m-%d %H:%M"),
             KEY_NAME: info["name"],
@@ -328,27 +342,6 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
-
-
-async def show_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    total_games = len(games)
-    if total_games == 0:
-        await update.message.reply_text("📋 Список пуст. Лимит: ~13 игр в одном закреплённом сообщении.")
-        return
-
-    sample_json = json.dumps(games, ensure_ascii=False)
-    current_bytes = len(sample_json.encode("utf-8"))
-    max_bytes = MAX_LEN
-    remaining_games = max(0, (max_bytes - current_bytes) // ESTIMATED_BYTES_PER_GAME)
-
-    lines = [
-        f"📊 Игр в списке: <b>{total_games}</b>",
-        f"📦 Занято: ~{current_bytes} / {max_bytes} символов",
-        f"➕ Ещё влезет (гарантированно): <b>~{remaining_games} игр</b>",
-        "",
-        "При превышении бот создаст второе закреплённое сообщение.",
-    ]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -406,7 +399,6 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("show", show_table))
     app.add_handler(CommandHandler("s", show_table))
-    app.add_handler(CommandHandler("limit", show_limit))
     app.add_handler(CommandHandler("delete", delete_game))
     app.add_handler(CommandHandler("d", delete_game))
     app.add_handler(CommandHandler("clear", clear_list))
