@@ -126,39 +126,37 @@ def get_steam_data(appid: str) -> dict | None:
             else:
                 price = "Нет цены"
 
-            # Режимы – только мультиплеер и его лимит (id 1-8)
+            # Режимы – мультиплеерные категории (1, 36-40, 44)
             categories = g.get("categories", [])
             player_limit = None
             has_multi = False
             has_coop = False
 
+            multi_ids = {1, 36, 37, 38, 39, 40, 44}
+
             for cat in categories:
                 cat_id = cat.get("id", 0)
-                # Мультиплеерные категории
-                if cat_id == 1:
+                if cat_id in multi_ids:
                     has_multi = True
-                elif cat_id == 2:
-                    has_multi = True
+
+                # Лимиты игроков (2-8)
+                if cat_id == 2:
                     player_limit = 2
                 elif cat_id == 3:
-                    has_multi = True
                     player_limit = 4
                 elif cat_id == 4:
-                    has_multi = True
                     player_limit = 6
                 elif cat_id == 5:
-                    has_multi = True
                     player_limit = 8
                 elif cat_id == 6:
-                    has_multi = True
                     player_limit = 12
                 elif cat_id == 7:
-                    has_multi = True
                     player_limit = 16
                 elif cat_id == 8:
-                    has_multi = True
                     player_limit = 24
-                elif cat_id == 9 or cat_id == 49:
+
+                # Кооператив (для текстового описания)
+                if cat_id == 9 or cat_id == 49:
                     has_coop = True
 
             # Короткая метка для /show
@@ -209,7 +207,6 @@ def build_short_table() -> str:
         price = html.escape(row.get(KEY_PRICE, row.get("Цена", "?")))
         link = f"https://store.steampowered.com/app/{appid}/"
         mode_str = row.get(KEY_MODES, "1👤")
-        # Название и цена в одной строке, режим на следующей с отступом
         lines.append(f'{idx}. <a href="{link}">{name}</a> — {price}')
         lines.append(f"   {mode_str}")
     lines.append(f"\nВсего игр: {len(games)}")
