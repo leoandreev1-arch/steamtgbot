@@ -23,19 +23,19 @@ TOKEN = os.environ["TOKEN"]
 STORAGE_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # твоя переменная – это хранилище
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-all_games: dict[str, dict[str, dict]] = {}
-pinned_messages: dict[int, int] = {}
+games: dict[str, dict] = {}           # единый список игр: { appid: {...} }
+pinned_messages: dict[int, int] = {}  # ID закреплённых таблиц по chat_id
 storage_msg_id: int | None = None
 
 KEY_DATE = "д"
 KEY_NAME = "н"
 KEY_PRICE = "ц"
 ESTIMATED_BYTES_PER_GAME = 150
-STEAM_DELAY = 2  # секунд паузы между запросами к Steam
+STEAM_DELAY = 2
 
 
 # ═══════════════ Работа с хранилищем ═════════════════════
-def load_all_data() -> dict[str, dict[str, dict]]:
+def load_all_data() -> dict[str, dict]:
     global storage_msg_id
     try:
         resp = requests.get(
@@ -48,7 +48,18 @@ def load_all_data() -> dict[str, dict[str, dict]]:
             msg = data["result"]["messages"][0]
             storage_msg_id = msg["message_id"]
             text = msg.get("text", "{}")
-            return json.loads(text)
+            raw = json.loads(text)
+            # Если старый формат (с chat_id), объединяем все игры в один словарь
+            if raw and isinstance(next(iter(raw.values())), dict) and not any(k.isdigit() and len(k) > 3 for k in raw):
+                # Похоже на плоский словарь appid → данные
+                return raw
+            else:
+                # Старый формат { chat_id: { appid: {...} } }
+                merged = {}
+                for chat_games in raw.values():
+                    if isinstance(chat_games, dict):
+                        merged.update(chat_games)
+                return merged
     except Exception as exc:
         logger.warning("Ошибка загрузки из хранилища: %s", exc)
     return {}
@@ -56,10 +67,9 @@ def load_all_data() -> dict[str, dict[str, dict]]:
 
 def save_all_data() -> None:
     global storage_msg_id
-    text = json.dumps(all_games, ensure_ascii=False, separators=(',', ':'))
+    text = json.dumps(games, ensure_ascii=False, separators=(',', ':'))
     try:
         if storage_msg_id:
-            # Пробуем редактировать существующее
             resp = requests.post(
                 f"{API_URL}/editMessageText",
                 json={
@@ -69,15 +79,9 @@ def save_all_data() -> None:
                 },
                 timeout=10,
             )
-            result = resp.json()
-            if result.get("ok"):
-                logger.debug("Сообщение в хранилище отредактировано (id=%d)", storage_msg_id)
+            if resp.json().get("ok"):
                 return
-            else:
-                logger.warning("Ошибка редактирования хранилища: %s", result)
-                # Не удаляем старое сообщение, чтобы не потерять данные, если ошибка временная
-                # Просто создадим новое (старое останется, его можно удалить вручную при необходимости)
-        # Создаём новое сообщение
+            logger.warning("Ошибка редактирования хранилища, создаю новое сообщение")
         resp = requests.post(
             f"{API_URL}/sendMessage",
             json={"chat_id": STORAGE_CHAT_ID, "text": text},
@@ -86,15 +90,12 @@ def save_all_data() -> None:
         data = resp.json()
         if data.get("ok"):
             storage_msg_id = data["result"]["message_id"]
-            logger.info("Создано новое сообщение в хранилище (id=%d)", storage_msg_id)
-        else:
-            logger.error("Не удалось отправить сообщение в хранилище: %s", data)
     except Exception as exc:
-        logger.error("Исключение при сохранении: %s", exc)
+        logger.error("Ошибка сохранения: %s", exc)
 
 
-# ═══════════════ Таблица для конкретного чата ═════════════
-def build_short_table(games: dict[str, dict]) -> str:
+# ═══════════════ Таблица (общая для всех чатов) ═════════════
+def build_short_table() -> str:
     if not games:
         return "📋 Список пока пуст."
 
@@ -151,8 +152,8 @@ def get_steam_data(appid: str) -> dict | None:
     return None
 
 
-def update_prices_for_chat(games: dict[str, dict]) -> bool:
-    """Обновляет цены для всех игр в словаре. Возвращает True, если что-то изменилось."""
+def update_prices_for_all() -> bool:
+    """Обновляет цены для всех игр. Возвращает True, если что-то изменилось."""
     changed = False
     for appid, info in games.items():
         try:
@@ -168,7 +169,7 @@ def update_prices_for_chat(games: dict[str, dict]) -> bool:
 
 
 # ═══════════════ Вспомогательные функции ═════════════════
-def get_sorted_games(games: dict[str, dict]):
+def get_sorted_games():
     return sorted(
         games.items(),
         key=lambda x: x[1].get(KEY_DATE, x[1].get("Дата", "")),
@@ -176,14 +177,14 @@ def get_sorted_games(games: dict[str, dict]):
     )
 
 
-def find_game_by_position(games: dict[str, dict], pos: int) -> str | None:
-    sorted_games = get_sorted_games(games)
+def find_game_by_position(pos: int) -> str | None:
+    sorted_games = get_sorted_games()
     if 1 <= pos <= len(sorted_games):
         return sorted_games[pos - 1][0]
     return None
 
 
-def find_game_by_name(games: dict[str, dict], name_part: str) -> str | None:
+def find_game_by_name(name_part: str) -> str | None:
     name_lower = name_part.lower()
     for appid, info in games.items():
         real_name = info.get(KEY_NAME, info.get("Название", ""))
@@ -193,11 +194,11 @@ def find_game_by_name(games: dict[str, dict], name_part: str) -> str | None:
 
 
 async def update_pinned_if_exists(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обновляет закреплённую таблицу в конкретном чате, если она была создана."""
     pinned_id = pinned_messages.get(chat_id)
     if pinned_id:
         try:
-            games = all_games.get(str(chat_id), {})
-            table = build_short_table(games)
+            table = build_short_table()
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=pinned_id,
@@ -209,6 +210,7 @@ async def update_pinned_if_exists(chat_id: int, context: ContextTypes.DEFAULT_TY
         except Exception:
             pinned_messages.pop(chat_id, None)
 
+    # Попробуем найти таблицу в закрепе этого чата
     try:
         resp = requests.get(
             f"{API_URL}/getChat",
@@ -219,8 +221,7 @@ async def update_pinned_if_exists(chat_id: int, context: ContextTypes.DEFAULT_TY
         if data.get("ok"):
             pinned = data["result"].get("pinned_message")
             if pinned and "text" in pinned and "📋 Сравнение игр" in pinned["text"]:
-                games = all_games.get(str(chat_id), {})
-                table = build_short_table(games)
+                table = build_short_table()
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=pinned["message_id"],
@@ -241,10 +242,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not appids:
         return
 
-    if str(chat_id) not in all_games:
-        all_games[str(chat_id)] = {}
-    games = all_games[str(chat_id)]
-
     new_games = 0
     for appid in appids:
         info = get_steam_data(appid)
@@ -259,27 +256,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         new_games += 1
 
     if new_games:
-        save_all_data()                              # сначала сохраняем новый список
-        prices_changed = update_prices_for_chat(games)  # обновляем цены
+        save_all_data()
+        # Обновляем цены всех игр
+        prices_changed = update_prices_for_all()
         if prices_changed:
-            save_all_data()                          # если цены изменились – сохраняем ещё раз
+            save_all_data()
+        # Обновляем закреп в том чате, где была добавлена игра (если был /pin)
         await update_pinned_if_exists(chat_id, context)
+        # Также обновим во всех остальных чатах, где есть закреп
+        for cid in list(pinned_messages.keys()):
+            if cid != chat_id:
+                await update_pinned_if_exists(cid, context)
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}"
         )
 
 
 async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    games = all_games.get(str(chat_id), {})
-    table = build_short_table(games)
-    await update.message.reply_text(table, parse_mode="HTML", disable_web_page_preview=True)
+    await update.message.reply_text(
+        build_short_table(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 async def pin_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Создаёт или обновляет закреплённую таблицу в текущем чате."""
     chat_id = update.effective_chat.id
-    games = all_games.get(str(chat_id), {})
-    table = build_short_table(games)
+    table = build_short_table()
 
     if chat_id not in pinned_messages:
         try:
@@ -338,8 +342,6 @@ async def unpin_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def show_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    games = all_games.get(str(chat_id), {})
     total = len(games)
     if total == 0:
         await update.message.reply_text("📋 Список пуст. Лимит: ~26 игр в одном закреплённом сообщении.")
@@ -358,8 +360,6 @@ async def show_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    games = all_games.get(str(chat_id), {})
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -373,7 +373,7 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if target.isdigit():
         pos = int(target)
         if pos > 0 and pos <= len(games):
-            appid_to_delete = find_game_by_position(games, pos)
+            appid_to_delete = find_game_by_position(pos)
         if not appid_to_delete and target in games:
             appid_to_delete = target
 
@@ -383,7 +383,7 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             appid_to_delete = match.group(1)
 
     if not appid_to_delete:
-        appid_to_delete = find_game_by_name(games, target)
+        appid_to_delete = find_game_by_name(target)
 
     if not appid_to_delete:
         await update.message.reply_text("❌ Игра не найдена.")
@@ -392,13 +392,13 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     name = games[appid_to_delete].get(KEY_NAME, appid_to_delete)
     del games[appid_to_delete]
     save_all_data()
-    await update_pinned_if_exists(chat_id, context)
+    # Обновляем закреп во всех чатах, где он есть
+    for cid in list(pinned_messages.keys()):
+        await update_pinned_if_exists(cid, context)
     await update.message.reply_text(f"🗑 Игра «{name}» удалена. Всего в списке: {len(games)}")
 
 
 async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    games = all_games.get(str(chat_id), {})
     args = context.args
     if not args or args[0].lower() not in ("yes", "да"):
         await update.message.reply_text("Для очистки списка введите /clear yes")
@@ -407,32 +407,34 @@ async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     count = len(games)
     games.clear()
     save_all_data()
-    await update_pinned_if_exists(chat_id, context)
+    for cid in list(pinned_messages.keys()):
+        await update_pinned_if_exists(cid, context)
     await update.message.reply_text(f"✅ Список очищен (удалено {count} игр)")
 
 
 # ═══════════════ Запуск ══════════════════════════════════
 async def post_init(app: Application) -> None:
-    global all_games, storage_msg_id
-    all_games = load_all_data()
-    logger.info("Загружено %d чатов из хранилища", len(all_games))
+    global games, storage_msg_id
+    games = load_all_data()
+    logger.info("Загружено %d игр из хранилища", len(games))
 
-    for chat_id_str in all_games:
+    # Восстанавливаем ID закреплённых таблиц во всех известных чатах
+    for chat_id_str in games:
         try:
-            chat_id = int(chat_id_str)
-            resp = requests.get(
-                f"{API_URL}/getChat",
-                params={"chat_id": chat_id},
-                timeout=10,
-            )
-            data = resp.json()
-            if data.get("ok"):
-                pinned = data["result"].get("pinned_message")
-                if pinned and "text" in pinned and "<b>📋 Сравнение игр</b>" in pinned["text"]:
-                    pinned_messages[chat_id] = pinned["message_id"]
-                    logger.info("Найдена закреплённая таблица в чате %d", chat_id)
-        except Exception as exc:
-            logger.warning("Не удалось проверить закреп в чате %s: %s", chat_id_str, exc)
+            chat_id = int(chat_id_str) if chat_id_str.isdigit() else None
+            if chat_id:
+                resp = requests.get(
+                    f"{API_URL}/getChat",
+                    params={"chat_id": chat_id},
+                    timeout=10,
+                )
+                data = resp.json()
+                if data.get("ok"):
+                    pinned = data["result"].get("pinned_message")
+                    if pinned and "text" in pinned and "<b>📋 Сравнение игр</b>" in pinned["text"]:
+                        pinned_messages[chat_id] = pinned["message_id"]
+        except Exception:
+            pass
 
 
 def main() -> None:
