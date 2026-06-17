@@ -39,9 +39,10 @@ def load_all_data() -> dict[str, dict]:
     """Загружает игры из последнего валидного JSON-сообщения в канале."""
     global storage_msg_id
     try:
+        # Проверяем до 20 последних сообщений, чтобы точно найти JSON
         resp = requests.get(
             f"{API_URL}/getChatHistory",
-            params={"chat_id": STORAGE_CHAT_ID, "limit": 5},
+            params={"chat_id": STORAGE_CHAT_ID, "limit": 20},
             timeout=10,
         )
         data = resp.json()
@@ -49,29 +50,32 @@ def load_all_data() -> dict[str, dict]:
             logger.info("Хранилище пусто")
             return {}
 
-        # Ищем первое сообщение с валидным JSON-объектом
+        logger.info("Проверяю %d сообщений в хранилище", len(data["result"]["messages"]))
         for msg in data["result"]["messages"]:
             text = msg.get("text", "").strip()
+            msg_id = msg["message_id"]
             if not text:
+                logger.debug("Сообщение %d пустое, пропускаю", msg_id)
                 continue
             try:
                 raw = json.loads(text)
             except Exception:
+                logger.debug("Сообщение %d не JSON, пропускаю", msg_id)
                 continue
             if not isinstance(raw, dict) or not raw:
+                logger.debug("Сообщение %d не словарь или пустой, пропускаю", msg_id)
                 continue
 
-            # Сообщение подходит
-            storage_msg_id = msg["message_id"]
+            # Нашли подходящее сообщение
+            storage_msg_id = msg_id
+            raw.pop("pinned_chat_id", None)  # удаляем служебный ключ, если есть
 
-            # Фильтруем служебный ключ (если есть)
-            raw.pop("pinned_chat_id", None)
-
-            # Если все ключи — числовые строки длиной от 5 символов, это плоский список игр
+            # Определяем формат: плоский список игр (ключи – appid)
             if all(isinstance(k, str) and k.isdigit() and len(k) >= 5 for k in raw):
+                logger.info("Загружено %d игр из сообщения %d (плоский формат)", len(raw), msg_id)
                 return raw
 
-            # Иначе пробуем старый формат {chat_id: {appid: данные}}
+            # Возможно, старый формат {chat_id: {appid: данные}}
             merged = {}
             for chat_games in raw.values():
                 if isinstance(chat_games, dict):
@@ -79,6 +83,7 @@ def load_all_data() -> dict[str, dict]:
                         if isinstance(appid, str) and appid.isdigit() and len(appid) >= 5:
                             merged[appid] = info
             if merged:
+                logger.info("Загружено %d игр из сообщения %d (объединённый формат)", len(merged), msg_id)
                 return merged
 
         logger.info("Не найдено подходящего JSON в хранилище")
@@ -93,6 +98,7 @@ def save_all_data() -> None:
     text = json.dumps(games, ensure_ascii=False, separators=(',', ':'))
     try:
         if storage_msg_id:
+            # Пробуем отредактировать известное сообщение
             resp = requests.post(
                 f"{API_URL}/editMessageText",
                 json={
@@ -104,7 +110,9 @@ def save_all_data() -> None:
             )
             if resp.json().get("ok"):
                 return
-            logger.warning("Ошибка редактирования хранилища, создаю новое сообщение")
+            logger.warning("Не удалось отредактировать сообщение %d, создаю новое", storage_msg_id)
+
+        # Создаём новое сообщение
         resp = requests.post(
             f"{API_URL}/sendMessage",
             json={"chat_id": STORAGE_CHAT_ID, "text": text},
@@ -112,7 +120,25 @@ def save_all_data() -> None:
         )
         data = resp.json()
         if data.get("ok"):
-            storage_msg_id = data["result"]["message_id"]
+            new_id = data["result"]["message_id"]
+            # Удаляем все остальные сообщения в канале, оставляя только новое
+            try:
+                history = requests.get(
+                    f"{API_URL}/getChatHistory",
+                    params={"chat_id": STORAGE_CHAT_ID, "limit": 50},
+                    timeout=10,
+                ).json()
+                if history.get("ok"):
+                    for msg in history["result"]["messages"]:
+                        if msg["message_id"] != new_id:
+                            requests.post(
+                                f"{API_URL}/deleteMessage",
+                                json={"chat_id": STORAGE_CHAT_ID, "message_id": msg["message_id"]},
+                                timeout=5,
+                            )
+            except Exception as exc:
+                logger.warning("Ошибка при очистке старых сообщений: %s", exc)
+            storage_msg_id = new_id
     except Exception as exc:
         logger.error("Ошибка сохранения: %s", exc)
 
