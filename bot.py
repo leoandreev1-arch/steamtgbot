@@ -36,13 +36,18 @@ STEAM_DELAY = 2
 
 # ═══════════════ Работа с хранилищем ═════════════════════
 def load_all_data() -> dict[str, dict]:
-    """Загружает игры из последнего валидного JSON-сообщения в канале."""
+    """
+    Просматривает последние 50 сообщений в канале,
+    находит то, в котором больше всего игр (по числу ключей-appid),
+    и загружает его содержимое как единый список.
+    """
     global storage_msg_id
+    best_games: dict[str, dict] = {}
+    best_msg_id = None
     try:
-        # Проверяем до 20 последних сообщений, чтобы точно найти JSON
         resp = requests.get(
             f"{API_URL}/getChatHistory",
-            params={"chat_id": STORAGE_CHAT_ID, "limit": 20},
+            params={"chat_id": STORAGE_CHAT_ID, "limit": 50},
             timeout=10,
         )
         data = resp.json()
@@ -55,50 +60,42 @@ def load_all_data() -> dict[str, dict]:
             text = msg.get("text", "").strip()
             msg_id = msg["message_id"]
             if not text:
-                logger.debug("Сообщение %d пустое, пропускаю", msg_id)
                 continue
             try:
                 raw = json.loads(text)
             except Exception:
-                logger.debug("Сообщение %d не JSON, пропускаю", msg_id)
                 continue
             if not isinstance(raw, dict) or not raw:
-                logger.debug("Сообщение %d не словарь или пустой, пропускаю", msg_id)
                 continue
 
-            # Нашли подходящее сообщение
-            storage_msg_id = msg_id
-            raw.pop("pinned_chat_id", None)  # удаляем служебный ключ, если есть
+            # Отфильтровываем служебный ключ
+            raw.pop("pinned_chat_id", None)
 
-            # Определяем формат: плоский список игр (ключи – appid)
-            if all(isinstance(k, str) and k.isdigit() and len(k) >= 5 for k in raw):
-                logger.info("Загружено %d игр из сообщения %d (плоский формат)", len(raw), msg_id)
-                return raw
+            # Собираем все ключи, похожие на appid (строка из цифр, длина >=5)
+            appids = {k: v for k, v in raw.items() if isinstance(k, str) and k.isdigit() and len(k) >= 5}
+            if len(appids) > len(best_games):
+                best_games = appids
+                best_msg_id = msg_id
+                logger.debug("Найдено %d игр в сообщении %d", len(appids), msg_id)
 
-            # Возможно, старый формат {chat_id: {appid: данные}}
-            merged = {}
-            for chat_games in raw.values():
-                if isinstance(chat_games, dict):
-                    for appid, info in chat_games.items():
-                        if isinstance(appid, str) and appid.isdigit() and len(appid) >= 5:
-                            merged[appid] = info
-            if merged:
-                logger.info("Загружено %d игр из сообщения %d (объединённый формат)", len(merged), msg_id)
-                return merged
-
-        logger.info("Не найдено подходящего JSON в хранилище")
-        return {}
+        if best_games and best_msg_id:
+            storage_msg_id = best_msg_id
+            logger.info("Загружено %d игр из сообщения %d", len(best_games), best_msg_id)
+            return best_games
+        else:
+            logger.info("Не найдено игр в хранилище")
+            return {}
     except Exception as exc:
         logger.warning("Ошибка загрузки из хранилища: %s", exc)
         return {}
 
 
 def save_all_data() -> None:
+    """Сохраняет игры в известное сообщение-хранилище; при необходимости создаёт новое и чистит старые."""
     global storage_msg_id
     text = json.dumps(games, ensure_ascii=False, separators=(',', ':'))
     try:
         if storage_msg_id:
-            # Пробуем отредактировать известное сообщение
             resp = requests.post(
                 f"{API_URL}/editMessageText",
                 json={
@@ -109,10 +106,12 @@ def save_all_data() -> None:
                 timeout=10,
             )
             if resp.json().get("ok"):
+                logger.debug("Сообщение %d отредактировано", storage_msg_id)
                 return
             logger.warning("Не удалось отредактировать сообщение %d, создаю новое", storage_msg_id)
+            storage_msg_id = None
 
-        # Создаём новое сообщение
+        # Создаём новое сообщение и удаляем все остальные
         resp = requests.post(
             f"{API_URL}/sendMessage",
             json={"chat_id": STORAGE_CHAT_ID, "text": text},
@@ -121,31 +120,37 @@ def save_all_data() -> None:
         data = resp.json()
         if data.get("ok"):
             new_id = data["result"]["message_id"]
-            # Удаляем все остальные сообщения в канале, оставляя только новое
-            try:
-                history = requests.get(
-                    f"{API_URL}/getChatHistory",
-                    params={"chat_id": STORAGE_CHAT_ID, "limit": 50},
-                    timeout=10,
-                ).json()
-                if history.get("ok"):
-                    for msg in history["result"]["messages"]:
-                        if msg["message_id"] != new_id:
-                            requests.post(
-                                f"{API_URL}/deleteMessage",
-                                json={"chat_id": STORAGE_CHAT_ID, "message_id": msg["message_id"]},
-                                timeout=5,
-                            )
-            except Exception as exc:
-                logger.warning("Ошибка при очистке старых сообщений: %s", exc)
+            delete_all_except(new_id)
             storage_msg_id = new_id
+            logger.info("Создано новое сообщение-хранилище %d", new_id)
     except Exception as exc:
         logger.error("Ошибка сохранения: %s", exc)
 
 
+def delete_all_except(keep_id: int) -> None:
+    """Удаляет все сообщения в канале-хранилище, кроме указанного."""
+    try:
+        resp = requests.get(
+            f"{API_URL}/getChatHistory",
+            params={"chat_id": STORAGE_CHAT_ID, "limit": 50},
+            timeout=10,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            return
+        for msg in data["result"]["messages"]:
+            if msg["message_id"] != keep_id:
+                requests.post(
+                    f"{API_URL}/deleteMessage",
+                    json={"chat_id": STORAGE_CHAT_ID, "message_id": msg["message_id"]},
+                    timeout=5,
+                )
+    except Exception as exc:
+        logger.warning("Ошибка при очистке старых сообщений: %s", exc)
+
+
 # ═══════════════ Установка реакции ══════════════════════
 def set_reaction(chat_id: int, message_id: int, emoji: str) -> None:
-    """Ставит реакцию на сообщение."""
     try:
         requests.post(
             f"{API_URL}/setMessageReaction",
@@ -219,7 +224,6 @@ def get_steam_data(appid: str) -> dict | None:
 
 
 def update_prices_for_all() -> bool:
-    """Обновляет цены для всех игр. Возвращает True, если что-то изменилось."""
     changed = False
     for appid, info in games.items():
         try:
@@ -260,7 +264,6 @@ def find_game_by_name(name_part: str) -> str | None:
 
 
 async def update_pinned_if_exists(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновляет закреплённую таблицу в конкретном чате, если она была создана."""
     pinned_id = pinned_messages.get(chat_id)
     if pinned_id:
         try:
@@ -342,7 +345,6 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def pin_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Создаёт или обновляет закреплённую таблицу в текущем чате."""
     chat_id = update.effective_chat.id
     table = build_short_table()
 
@@ -472,6 +474,49 @@ async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(f"✅ Список очищен (удалено {count} игр)")
 
 
+async def fix_storage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Команда /fixstorage – объединяет все игры из всех сообщений канала
+    в одно и удаляет остальные.
+    """
+    global games, storage_msg_id
+    try:
+        resp = requests.get(
+            f"{API_URL}/getChatHistory",
+            params={"chat_id": STORAGE_CHAT_ID, "limit": 50},
+            timeout=10,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            await update.message.reply_text("❌ Не удалось получить историю хранилища.")
+            return
+
+        merged: dict[str, dict] = {}
+        for msg in data["result"]["messages"]:
+            text = msg.get("text", "")
+            try:
+                raw = json.loads(text)
+            except Exception:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            raw.pop("pinned_chat_id", None)
+            for k, v in raw.items():
+                if isinstance(k, str) and k.isdigit() and len(k) >= 5:
+                    merged[k] = v
+
+        if not merged:
+            await update.message.reply_text("ℹ️ Не найдено игр в хранилище.")
+            return
+
+        games = merged
+        save_all_data()  # это создаст/отредактирует сообщение и удалит все остальные
+        await update.message.reply_text(f"✅ Хранилище исправлено. Игр: {len(games)}")
+    except Exception as exc:
+        logger.error("Ошибка в /fixstorage: %s", exc)
+        await update.message.reply_text("❌ Произошла ошибка.")
+
+
 # ═══════════════ Запуск ══════════════════════════════════
 async def post_init(app: Application) -> None:
     global games, storage_msg_id
@@ -491,6 +536,7 @@ def main() -> None:
     app.add_handler(CommandHandler("delete", delete_game))
     app.add_handler(CommandHandler("d", delete_game))
     app.add_handler(CommandHandler("clear", clear_list))
+    app.add_handler(CommandHandler("fixstorage", fix_storage))
 
     webhook_url = os.environ.get("WEBHOOK_URL")
     if webhook_url:
