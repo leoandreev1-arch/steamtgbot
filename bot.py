@@ -25,6 +25,12 @@ API_URL = f"https://api.telegram.org/bot{TOKEN}"
 games: dict[str, dict] = {}
 pinned_msg_id: int | None = None
 
+# Короткие ключи для экономии места
+KEY_DATE = "д"
+KEY_NAME = "н"
+KEY_PRICE = "ц"
+ESTIMATED_BYTES_PER_GAME = 150  # оценка с короткими ключами
+
 
 # ── Восстановление из закрепа ──────────────────────────────
 async def restore_from_pinned(app: Application) -> None:
@@ -70,7 +76,6 @@ async def save_to_pinned(context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 pinned_msg_id = None
 
-        # Создаём новое и закрепляем
         resp = requests.post(
             f"{API_URL}/sendMessage",
             json={"chat_id": GROUP_CHAT_ID, "text": text},
@@ -137,13 +142,13 @@ def build_short_table() -> str:
 
     sorted_games = sorted(
         games.items(),
-        key=lambda x: x[1].get("Дата", x[1].get("д", "")),
+        key=lambda x: x[1].get(KEY_DATE, x[1].get("Дата", "")),
         reverse=True,
     )
     lines = ["<b>📋 Сравнение игр</b>\n"]
     for idx, (appid, row) in enumerate(sorted_games, 1):
-        name = html.escape(row.get("Название", row.get("н", "?")))
-        price = html.escape(row.get("Цена", row.get("ц", "?")))
+        name = html.escape(row.get(KEY_NAME, row.get("Название", "?")))
+        price = html.escape(row.get(KEY_PRICE, row.get("Цена", "?")))
         link = f"https://store.steampowered.com/app/{appid}/"
         lines.append(f'{idx}. <a href="{link}">{name}</a> — {price}')
     lines.append(f"\nВсего игр: {len(games)}")
@@ -153,7 +158,7 @@ def build_short_table() -> str:
 def get_sorted_games():
     return sorted(
         games.items(),
-        key=lambda x: x[1].get("Дата", x[1].get("д", "")),
+        key=lambda x: x[1].get(KEY_DATE, x[1].get("Дата", "")),
         reverse=True,
     )
 
@@ -168,7 +173,7 @@ def find_game_by_position(pos: int) -> str | None:
 def find_game_by_name(name_part: str) -> str | None:
     name_lower = name_part.lower()
     for appid, info in games.items():
-        real_name = info.get("Название", info.get("н", ""))
+        real_name = info.get(KEY_NAME, info.get("Название", ""))
         if name_lower in real_name.lower():
             return appid
     return None
@@ -187,10 +192,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if info is None:
             await update.message.reply_text(f"❌ Не удалось найти данные об игре {appid}")
             continue
+        # ✅ Используем короткие ключи
         games[appid] = {
-            "Дата": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "Название": info["name"],
-            "Цена": info["price"],
+            KEY_DATE: datetime.now().strftime("%Y-%m-%d %H:%M"),
+            KEY_NAME: info["name"],
+            KEY_PRICE: info["price"],
         }
         new_games += 1
 
@@ -213,18 +219,20 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def show_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     total_games = len(games)
     if total_games == 0:
-        await update.message.reply_text("📋 Список пуст. Лимит: ~13 игр в одном закреплённом сообщении.")
+        await update.message.reply_text("📋 Список пуст. Лимит: ~26 игр в одном закреплённом сообщении.")
         return
 
     sample_json = json.dumps(games, ensure_ascii=False)
     current_bytes = len(sample_json.encode("utf-8"))
     max_bytes = 4000
-    remaining_games = max(0, (max_bytes - current_bytes) // 300)
+    remaining_games = max(0, (max_bytes - current_bytes) // ESTIMATED_BYTES_PER_GAME)
 
     lines = [
         f"📊 Игр в списке: <b>{total_games}</b>",
         f"📦 Занято: ~{current_bytes} / {max_bytes} символов",
         f"➕ Ещё влезет: <b>~{remaining_games} игр</b>",
+        "",
+        "При превышении лимита бот создаст второе закреплённое сообщение.",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -259,7 +267,7 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("❌ Игра не найдена.")
         return
 
-    name = games[appid_to_delete].get("Название", games[appid_to_delete].get("н", appid_to_delete))
+    name = games[appid_to_delete].get(KEY_NAME, games[appid_to_delete].get("Название", appid_to_delete))
     del games[appid_to_delete]
     await save_to_pinned(context)
     await update.message.reply_text(f"🗑 Игра «{name}» удалена. Всего в списке: {len(games)}")
