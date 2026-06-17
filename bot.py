@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 
 import requests
@@ -19,20 +20,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
-STORAGE_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # используем GROUP_CHAT_ID как хранилище
+STORAGE_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # твоя переменная – это хранилище
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-# Данные всех чатов: { chat_id: { appid: {...} } }
 all_games: dict[str, dict[str, dict]] = {}
-# ID закреплённых таблиц: { chat_id: message_id }
 pinned_messages: dict[int, int] = {}
-# ID сообщения в хранилище (редактируем его, а не создаём новое)
 storage_msg_id: int | None = None
 
 KEY_DATE = "д"
 KEY_NAME = "н"
 KEY_PRICE = "ц"
 ESTIMATED_BYTES_PER_GAME = 150
+STEAM_DELAY = 2  # секунд паузы между запросами к Steam
 
 
 # ═══════════════ Работа с хранилищем ═════════════════════
@@ -143,6 +142,24 @@ def get_steam_data(appid: str) -> dict | None:
     return None
 
 
+def update_prices_for_chat(games: dict[str, dict]) -> bool:
+    """Обновляет цены для всех игр в словаре. Возвращает True, если что-то изменилось."""
+    changed = False
+    for appid, info in games.items():
+        try:
+            # Пауза перед каждым запросом (кроме первого)
+            if appid != next(iter(games)):
+                time.sleep(STEAM_DELAY)
+            fresh = get_steam_data(appid)
+            if fresh and fresh["price"] != info.get(KEY_PRICE):
+                info[KEY_PRICE] = fresh["price"]
+                changed = True
+        except Exception:
+            # Игнорируем ошибки, чтобы не потерять игру
+            continue
+    return changed
+
+
 # ═══════════════ Вспомогательные функции ═════════════════
 def get_sorted_games(games: dict[str, dict]):
     return sorted(
@@ -169,8 +186,6 @@ def find_game_by_name(games: dict[str, dict], name_part: str) -> str | None:
 
 
 async def update_pinned_if_exists(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновляет закреплённую таблицу, если она есть. Если нет – ничего не делает."""
-    # Сначала попробуем найти закреплённую таблицу по ID (если известен)
     pinned_id = pinned_messages.get(chat_id)
     if pinned_id:
         try:
@@ -185,10 +200,8 @@ async def update_pinned_if_exists(chat_id: int, context: ContextTypes.DEFAULT_TY
             )
             return
         except Exception:
-            # Если не получилось отредактировать (например, сообщение удалено), сбрасываем ID и пробуем найти новое
             pinned_messages.pop(chat_id, None)
 
-    # Попробуем найти любое закреплённое сообщение с таблицей в этом чате
     try:
         resp = requests.get(
             f"{API_URL}/getChat",
@@ -199,7 +212,6 @@ async def update_pinned_if_exists(chat_id: int, context: ContextTypes.DEFAULT_TY
         if data.get("ok"):
             pinned = data["result"].get("pinned_message")
             if pinned and "text" in pinned and "📋 Сравнение игр" in pinned["text"]:
-                # Нашли таблицу – обновим её
                 games = all_games.get(str(chat_id), {})
                 table = build_short_table(games)
                 await context.bot.edit_message_text(
@@ -241,8 +253,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if new_games:
         save_all_data()
+        # Обновляем цены всех игр в этом чате (тихо)
+        update_prices_for_chat(games)
+        save_all_data()
+
         await update_pinned_if_exists(chat_id, context)
-        # Только короткий ответ – без /show и /pin
+
+        # Только короткий ответ
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}"
         )
@@ -256,12 +273,10 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def pin_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Создаёт или обновляет закреплённую таблицу в текущем чате."""
     chat_id = update.effective_chat.id
     games = all_games.get(str(chat_id), {})
     table = build_short_table(games)
 
-    # Попробуем обновить существующую, ища её через API, если ID неизвестен
     if chat_id not in pinned_messages:
         try:
             resp = requests.get(
@@ -398,7 +413,6 @@ async def post_init(app: Application) -> None:
     all_games = load_all_data()
     logger.info("Загружено %d чатов из хранилища", len(all_games))
 
-    # Восстанавливаем ID закреплённых таблиц, если они есть
     for chat_id_str in all_games:
         try:
             chat_id = int(chat_id_str)
