@@ -242,30 +242,33 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def pin_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновляет закреплённую таблицу (не JSON, а красивую таблицу)."""
+    """
+    Всегда создаёт новое сообщение с таблицей и закрепляет его.
+    Старый закреп (JSON или таблицу) открепляет.
+    """
     table = build_short_table()
     try:
-        if pinned_msg_id:
-            await context.bot.edit_message_text(
-                chat_id=GROUP_CHAT_ID,
-                message_id=pinned_msg_id,
-                text=table,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        else:
-            msg = await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=table,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-            await msg.pin()
-            pinned_msg_id = msg.message_id
+        # Отправляем новое сообщение
+        msg = await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=table,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        # Закрепляем его
+        await msg.pin()
+        pinned_msg_id = msg.message_id   # обновляем ID закреплённого сообщения
+
+        # Пробуем открепить предыдущее закреплённое сообщение (если было)
+        try:
+            await context.bot.unpin_chat_message(chat_id=GROUP_CHAT_ID)
+        except Exception:
+            pass  # ничего страшного, если не получилось
+
         await update.message.reply_text("✅ Таблица закреплена.")
     except Exception as exc:
         logger.error("Ошибка закрепления: %s", exc)
-        await update.message.reply_text("❌ Не удалось закрепить таблицу. Проверьте права бота.")
+        await update.message.reply_text(f"❌ Не удалось закрепить таблицу. Ошибка: {exc}")
 
 
 async def show_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
