@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import time
 from datetime import datetime
 
 import requests
@@ -20,71 +19,82 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
-STORAGE_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # Это ID канала-хранилища (где лежит JSON)
+GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # ID твоей группы
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-games: dict[str, dict] = {}           # единый список игр
-storage_msg_id: int | None = None     # ID сообщения с JSON в канале-хранилище
+games: dict[str, dict] = {}
+pinned_msg_id: int | None = None
 
 KEY_DATE = "д"
 KEY_NAME = "н"
 KEY_PRICE = "ц"
 ESTIMATED_BYTES_PER_GAME = 150
-STEAM_DELAY = 2
 
 
-# ═══════════════ Работа с хранилищем (канал) ═════════════════
-def load_games_from_storage() -> dict[str, dict]:
-    global storage_msg_id
+# ── Восстановление из закрепа ──────────────────────────────
+async def restore_from_pinned(app: Application) -> None:
+    global games, pinned_msg_id
     try:
         resp = requests.get(
-            f"{API_URL}/getChatHistory",
-            params={"chat_id": STORAGE_CHAT_ID, "limit": 1},
+            f"{API_URL}/getChat",
+            params={"chat_id": GROUP_CHAT_ID},
             timeout=10,
         )
         data = resp.json()
-        if data.get("ok") and data["result"]["messages"]:
-            msg = data["result"]["messages"][0]
-            storage_msg_id = msg["message_id"]
-            text = msg.get("text", "{}")
-            return json.loads(text)
+        if not data.get("ok"):
+            logger.warning("Ошибка получения чата: %s", data)
+            return
+
+        pinned = data["result"].get("pinned_message")
+        if pinned and "text" in pinned:
+            games = json.loads(pinned["text"])
+            pinned_msg_id = pinned["message_id"]
+            logger.info("Восстановлено %d игр из закрепа", len(games))
+        else:
+            logger.info("Закреплённое сообщение не найдено")
     except Exception as exc:
-        logger.warning("Ошибка загрузки из хранилища: %s", exc)
-    return {}
+        logger.warning("Ошибка восстановления: %s", exc)
 
 
-def save_games_to_storage() -> None:
-    global storage_msg_id
-    text = json.dumps(games, ensure_ascii=False, separators=(',', ':'))
+async def save_to_pinned(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global pinned_msg_id
+    text = json.dumps(games, ensure_ascii=False)
     try:
-        if storage_msg_id:
+        if pinned_msg_id:
             resp = requests.post(
                 f"{API_URL}/editMessageText",
                 json={
-                    "chat_id": STORAGE_CHAT_ID,
-                    "message_id": storage_msg_id,
+                    "chat_id": GROUP_CHAT_ID,
+                    "message_id": pinned_msg_id,
                     "text": text,
                 },
                 timeout=10,
             )
             if resp.json().get("ok"):
                 return
-            storage_msg_id = None
+            else:
+                pinned_msg_id = None
 
         resp = requests.post(
             f"{API_URL}/sendMessage",
-            json={"chat_id": STORAGE_CHAT_ID, "text": text},
+            json={"chat_id": GROUP_CHAT_ID, "text": text},
             timeout=10,
         )
         data = resp.json()
         if data.get("ok"):
-            storage_msg_id = data["result"]["message_id"]
+            new_id = data["result"]["message_id"]
+            requests.post(
+                f"{API_URL}/pinChatMessage",
+                json={"chat_id": GROUP_CHAT_ID, "message_id": new_id},
+                timeout=10,
+            )
+            pinned_msg_id = new_id
     except Exception as exc:
-        logger.error("Ошибка сохранения в хранилище: %s", exc)
+        logger.error("Ошибка сохранения: %s", exc)
 
 
-# ═══════════════ Реакция 👌 ══════════════════════════════
-def set_reaction(chat_id: int, message_id: int, emoji: str) -> None:
+# ── Реакция 👌 на сообщение ──────────────────────────────
+def set_reaction(chat_id: int, message_id: int, emoji: str = "👌") -> None:
     try:
         requests.post(
             f"{API_URL}/setMessageReaction",
@@ -96,30 +106,10 @@ def set_reaction(chat_id: int, message_id: int, emoji: str) -> None:
             timeout=10,
         )
     except Exception as exc:
-        logger.error("Ошибка реакции: %s", exc)
+        logger.error("Ошибка установки реакции: %s", exc)
 
 
-# ═══════════════ Таблица ═════════════════════════════════
-def build_short_table() -> str:
-    if not games:
-        return "📋 Список пока пуст."
-
-    sorted_games = sorted(
-        games.items(),
-        key=lambda x: x[1].get(KEY_DATE, x[1].get("Дата", "")),
-        reverse=True,
-    )
-    lines = ["<b>📋 Сравнение игр</b>\n"]
-    for idx, (appid, row) in enumerate(sorted_games, 1):
-        name = html.escape(row.get(KEY_NAME, row.get("Название", "?")))
-        price = html.escape(row.get(KEY_PRICE, row.get("Цена", "?")))
-        link = f"https://store.steampowered.com/app/{appid}/"
-        lines.append(f'{idx}. <a href="{link}">{name}</a> — {price}')
-    lines.append(f"\nВсего игр: {len(games)}")
-    return "\n".join(lines)
-
-
-# ═══════════════ Steam API ═══════════════════════════════
+# ── Steam API ─────────────────────────────────────────────
 def get_steam_data(appid: str) -> dict | None:
     for region, lang, currency_label in [
         ("ru", "russian", "₽"),
@@ -157,22 +147,26 @@ def get_steam_data(appid: str) -> dict | None:
     return None
 
 
-def update_prices_for_all() -> bool:
-    changed = False
-    for appid, info in games.items():
-        try:
-            if appid != next(iter(games)):
-                time.sleep(STEAM_DELAY)
-            fresh = get_steam_data(appid)
-            if fresh and fresh["price"] != info.get(KEY_PRICE):
-                info[KEY_PRICE] = fresh["price"]
-                changed = True
-        except Exception:
-            continue
-    return changed
+# ── Таблица ───────────────────────────────────────────────
+def build_short_table() -> str:
+    if not games:
+        return "📋 Список пока пуст."
+
+    sorted_games = sorted(
+        games.items(),
+        key=lambda x: x[1].get(KEY_DATE, x[1].get("Дата", "")),
+        reverse=True,
+    )
+    lines = ["<b>📋 Сравнение игр</b>\n"]
+    for idx, (appid, row) in enumerate(sorted_games, 1):
+        name = html.escape(row.get(KEY_NAME, row.get("Название", "?")))
+        price = html.escape(row.get(KEY_PRICE, row.get("Цена", "?")))
+        link = f"https://store.steampowered.com/app/{appid}/"
+        lines.append(f'{idx}. <a href="{link}">{name}</a> — {price}')
+    lines.append(f"\nВсего игр: {len(games)}")
+    return "\n".join(lines)
 
 
-# ═══════════════ Вспомогательные функции ═════════════════
 def get_sorted_games():
     return sorted(
         games.items(),
@@ -197,7 +191,7 @@ def find_game_by_name(name_part: str) -> str | None:
     return None
 
 
-# ═══════════════ Обработчики команд ══════════════════════
+# ── Обработчики ──────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     message_id = update.effective_message.message_id
@@ -220,11 +214,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         new_games += 1
 
     if new_games:
-        save_games_to_storage()
-        prices_changed = update_prices_for_all()
-        if prices_changed:
-            save_games_to_storage()
+        await save_to_pinned(context)
         set_reaction(chat_id, message_id, "👌")
+        await update.message.reply_text(
+            f"✅ Игры добавлены. Всего в списке: {len(games)}"
+        )
 
 
 async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -236,49 +230,54 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def pin_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Создаёт новое сообщение с таблицей и закрепляет его
-    в том чате, где была вызвана команда.
-    Старый закреп (если был) открепляется.
-    """
-    chat_id = update.effective_chat.id          # чат, в котором написана команда
+    """Создаёт или обновляет закреплённую таблицу в группе."""
     table = build_short_table()
     try:
-        # Отправляем новое сообщение
+        # Пробуем отредактировать текущий закреп
+        if pinned_msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=GROUP_CHAT_ID,
+                    message_id=pinned_msg_id,
+                    text=table,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                await update.message.reply_text("✅ Таблица обновлена в закрепе.")
+                return
+            except Exception:
+                # Если не получилось отредактировать, создаём новое
+                pinned_msg_id = None
+
+        # Создаём новое и закрепляем
         msg = await context.bot.send_message(
-            chat_id=chat_id,                    # теперь правильный чат
+            chat_id=GROUP_CHAT_ID,
             text=table,
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
-        # Закрепляем его
         await msg.pin()
-        # Пробуем открепить предыдущее закреплённое сообщение (если было)
-        try:
-            await context.bot.unpin_chat_message(chat_id=chat_id)
-        except Exception:
-            pass  # ничего страшного, если не получилось
-
+        pinned_msg_id = msg.message_id
         await update.message.reply_text("✅ Таблица закреплена.")
     except Exception as exc:
         logger.error("Ошибка закрепления: %s", exc)
-        await update.message.reply_text(f"❌ Не удалось закрепить таблицу. Ошибка: {exc}")
+        await update.message.reply_text("❌ Не удалось закрепить таблицу. Проверьте права бота.")
 
 
 async def show_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    total = len(games)
-    if total == 0:
+    total_games = len(games)
+    if total_games == 0:
         await update.message.reply_text("📋 Список пуст. Лимит: ~26 игр в одном закреплённом сообщении.")
         return
 
-    sample = json.dumps(games, ensure_ascii=False)
-    current = len(sample.encode("utf-8"))
-    remaining = max(0, (4000 - current) // ESTIMATED_BYTES_PER_GAME)
+    sample_json = json.dumps(games, ensure_ascii=False)
+    current_bytes = len(sample_json.encode("utf-8"))
+    remaining_games = max(0, (4000 - current_bytes) // ESTIMATED_BYTES_PER_GAME)
 
     lines = [
-        f"📊 Игр в списке: <b>{total}</b>",
-        f"📦 Занято: ~{current} / 4000 символов",
-        f"➕ Ещё влезет: <b>~{remaining} игр</b>",
+        f"📊 Игр в списке: <b>{total_games}</b>",
+        f"📦 Занято: ~{current_bytes} / 4000 символов",
+        f"➕ Ещё влезет: <b>~{remaining_games} игр</b>",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -313,9 +312,9 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("❌ Игра не найдена.")
         return
 
-    name = games[appid_to_delete].get(KEY_NAME, appid_to_delete)
+    name = games[appid_to_delete].get(KEY_NAME, games[appid_to_delete].get("Название", appid_to_delete))
     del games[appid_to_delete]
-    save_games_to_storage()
+    await save_to_pinned(context)
     await update.message.reply_text(f"🗑 Игра «{name}» удалена. Всего в списке: {len(games)}")
 
 
@@ -327,19 +326,13 @@ async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     count = len(games)
     games.clear()
-    save_games_to_storage()
+    await save_to_pinned(context)
     await update.message.reply_text(f"✅ Список очищен (удалено {count} игр)")
 
 
-# ═══════════════ Запуск ══════════════════════════════════
-async def post_init(app: Application) -> None:
-    global games, storage_msg_id
-    games = load_games_from_storage()
-    logger.info("Загружено %d игр из хранилища", len(games))
-
-
+# ── Запуск ───────────────────────────────────────────────
 def main() -> None:
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TOKEN).post_init(restore_from_pinned).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("show", show_table))
