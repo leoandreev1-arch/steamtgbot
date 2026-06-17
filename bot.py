@@ -23,74 +23,206 @@ GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 games: dict[str, dict] = {}
-pinned_msg_id: int | None = None
+pinned_msg_ids: list[int] = []   # ID закреплённых сообщений-частей
+MAX_LEN = 4000                   # запас до лимита 4096
+
+# Поля в хранилище (короткие ключи)
+KEY_DATE = "д"
+KEY_NAME = "н"
+KEY_PRICE = "ц"
 
 
 # ── Восстановление из закрепа ──────────────────────────────
-async def restore_from_pinned(app: Application) -> None:
-    global games, pinned_msg_id
+async def restore_data(app: Application) -> None:
+    global games, pinned_msg_ids
     try:
         resp = requests.get(
-            f"{API_URL}/getChat",
+            f"{API_URL}/getChatPinnedMessages",
             params={"chat_id": GROUP_CHAT_ID},
             timeout=10,
         )
         data = resp.json()
         if not data.get("ok"):
-            logger.warning("Ошибка получения чата: %s", data)
+            logger.warning("Ошибка получения закреплённых сообщений: %s", data)
             return
 
-        pinned = data["result"].get("pinned_message")
-        if pinned and "text" in pinned:
-            games = json.loads(pinned["text"])
-            pinned_msg_id = pinned["message_id"]
-            logger.info("Восстановлено %d игр из закрепа", len(games))
+        messages = data["result"]["messages"]
+        if not messages:
+            logger.info("Нет закреплённых сообщений")
+            return
+
+        parts = {}
+        single_candidate = None
+
+        for msg in messages:
+            text = msg.get("text", "")
+            if text.startswith("PART:"):
+                try:
+                    header, body = text.split("\n", 1)
+                    part_num, total = (int(x) for x in header[5:].split("/"))
+                    parts[part_num] = body
+                except Exception:
+                    continue
+            elif text:
+                # Возможно, старая одиночная версия
+                single_candidate = text
+
+        if parts:
+            sorted_parts = [parts[i] for i in sorted(parts.keys())]
+            full_json = "".join(sorted_parts)
+            games = json.loads(full_json)
+            pinned_msg_ids = [m["message_id"] for m in messages if m.get("text", "").startswith("PART:")]
+            logger.info("Восстановлено %d игр из закрепа (%d частей)", len(games), len(parts))
+        elif single_candidate:
+            # Старая одиночная версия
+            try:
+                games = json.loads(single_candidate)
+                pinned_msg_ids = [messages[-1]["message_id"]]
+                logger.info("Восстановлено %d игр (старое одиночное сообщение)", len(games))
+            except Exception:
+                logger.info("Закреплённое сообщение не содержит валидный JSON")
         else:
-            logger.info("Закреплённое сообщение не найдено")
+            logger.info("Закреплённые сообщения не содержат данных")
+
+        # Конвертируем старые длинные ключи в новые короткие, если нужно
+        convert_old_keys()
     except Exception as exc:
         logger.warning("Ошибка восстановления: %s", exc)
 
 
-async def save_to_pinned(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global pinned_msg_id
+def convert_old_keys() -> None:
+    """Преобразует старые длинные ключи в новые короткие."""
+    changed = False
+    for appid, info in games.items():
+        # Проверяем, есть ли старые ключи
+        if "Название" in info and KEY_NAME not in info:
+            info[KEY_NAME] = info.pop("Название")
+            changed = True
+        if "Цена" in info and KEY_PRICE not in info:
+            info[KEY_PRICE] = info.pop("Цена")
+            changed = True
+        if "Дата" in info and KEY_DATE not in info:
+            info[KEY_DATE] = info.pop("Дата")
+            changed = True
+        # Удаляем больше не нужные ключи
+        for old_key in ("Жанры", "Ссылка"):
+            info.pop(old_key, None)
+    if changed:
+        logger.info("Ключи старых игр преобразованы в короткие")
+
+
+# ── Сохранение в закреп (многосообщенческое) ──────────────
+async def save_data(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global pinned_msg_ids
     text = json.dumps(games, ensure_ascii=False)
-    try:
-        if pinned_msg_id:
+
+    # Если влезает в одно сообщение
+    if len(text) <= MAX_LEN:
+        try:
+            if pinned_msg_ids:
+                # Пробуем отредактировать последнее
+                resp = requests.post(
+                    f"{API_URL}/editMessageText",
+                    json={
+                        "chat_id": GROUP_CHAT_ID,
+                        "message_id": pinned_msg_ids[-1],
+                        "text": text,
+                    },
+                    timeout=10,
+                )
+                if resp.json().get("ok"):
+                    # Удаляем лишние старые закреплённые
+                    for old_id in pinned_msg_ids[:-1]:
+                        requests.post(
+                            f"{API_URL}/deleteMessage",
+                            json={"chat_id": GROUP_CHAT_ID, "message_id": old_id},
+                            timeout=5,
+                        )
+                    pinned_msg_ids = [pinned_msg_ids[-1]]
+                    return
+            # Создаём новое и закрепляем
             resp = requests.post(
-                f"{API_URL}/editMessageText",
-                json={
-                    "chat_id": GROUP_CHAT_ID,
-                    "message_id": pinned_msg_id,
-                    "text": text,
-                },
+                f"{API_URL}/sendMessage",
+                json={"chat_id": GROUP_CHAT_ID, "text": text},
                 timeout=10,
             )
             data = resp.json()
             if data.get("ok"):
-                return
-            else:
-                pinned_msg_id = None
+                new_id = data["result"]["message_id"]
+                requests.post(
+                    f"{API_URL}/pinChatMessage",
+                    json={"chat_id": GROUP_CHAT_ID, "message_id": new_id},
+                    timeout=10,
+                )
+                # Удаляем все старые закреплённые
+                for old_id in pinned_msg_ids:
+                    requests.post(
+                        f"{API_URL}/deleteMessage",
+                        json={"chat_id": GROUP_CHAT_ID, "message_id": old_id},
+                        timeout=5,
+                    )
+                pinned_msg_ids = [new_id]
+        except Exception as exc:
+            logger.error("Ошибка сохранения: %s", exc)
+        return
 
-        # Создаём новое
-        resp = requests.post(
-            f"{API_URL}/sendMessage",
-            json={"chat_id": GROUP_CHAT_ID, "text": text},
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get("ok"):
+    # ---- Многосообщенческое сохранение ----
+    parts = []
+    remaining = text
+    while remaining:
+        split_at = min(MAX_LEN, len(remaining))
+        if split_at < len(remaining):
+            # Ищем безопасное место для разрыва (после запятой)
+            last_comma = remaining.rfind(",", 0, split_at)
+            if last_comma > MAX_LEN // 2:
+                split_at = last_comma + 1
+        parts.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+
+    total = len(parts)
+    new_ids = []
+
+    for i, part in enumerate(parts, 1):
+        header = f"PART:{i}/{total}\n"
+        msg_text = header + part
+        try:
+            resp = requests.post(
+                f"{API_URL}/sendMessage",
+                json={"chat_id": GROUP_CHAT_ID, "text": msg_text},
+                timeout=10,
+            )
+            data = resp.json()
+            if not data.get("ok"):
+                logger.error("Ошибка отправки части %d: %s", i, data)
+                return
             new_id = data["result"]["message_id"]
             requests.post(
                 f"{API_URL}/pinChatMessage",
                 json={"chat_id": GROUP_CHAT_ID, "message_id": new_id},
                 timeout=10,
             )
-            pinned_msg_id = new_id
-    except Exception as exc:
-        logger.error("Ошибка сохранения: %s", exc)
+            new_ids.append(new_id)
+        except Exception as exc:
+            logger.error("Исключение при отправке части %d: %s", i, exc)
+            return
+
+    # Удаляем старые закреплённые сообщения
+    for old_id in pinned_msg_ids:
+        if old_id not in new_ids:
+            try:
+                requests.post(
+                    f"{API_URL}/deleteMessage",
+                    json={"chat_id": GROUP_CHAT_ID, "message_id": old_id},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+    pinned_msg_ids = new_ids
+    logger.info("Данные сохранены в %d закреплённых сообщениях", total)
 
 
-# ── Steam API ───────────────────────────────────────────────
+# ── Steam API ─────────────────────────────────────────────
 def get_steam_data(appid: str) -> dict | None:
     for region, lang, currency_label in [
         ("ru", "russian", "₽"),
@@ -122,32 +254,45 @@ def get_steam_data(appid: str) -> dict | None:
             else:
                 price = "Нет цены"
 
-            genres_list = [x["description"] for x in g.get("genres", [])]
-            genres = ", ".join(genres_list) if genres_list else "Не указаны"
-
+            # Жанры не сохраняем, они не используются в /show
             return {
                 "name": name,
                 "price": price,
-                "genres": genres,
-                "link": f"https://store.steampowered.com/app/{appid}/",
             }
         except Exception:
             continue
     return None
 
 
-# ── Вспомогательные функции ────────────────────────────────
+# ── Таблица ───────────────────────────────────────────────
+def build_short_table() -> str:
+    if not games:
+        return "📋 Список пока пуст."
+
+    sorted_games = sorted(
+        games.items(),
+        key=lambda x: x[1].get(KEY_DATE, ""),
+        reverse=True,
+    )
+    lines = ["<b>📋 Сравнение игр</b>\n"]
+    for idx, (appid, row) in enumerate(sorted_games, 1):
+        name = html.escape(row.get(KEY_NAME, "?"))
+        price = html.escape(row.get(KEY_PRICE, "?"))
+        link = f"https://store.steampowered.com/app/{appid}/"
+        lines.append(f'{idx}. <a href="{link}">{name}</a> — {price}')
+    lines.append(f"\nВсего игр: {len(games)}")
+    return "\n".join(lines)
+
+
 def get_sorted_games():
-    """Возвращает отсортированный список (appid, данные), как в /show."""
     return sorted(
         games.items(),
-        key=lambda x: x[1].get("Дата", ""),
+        key=lambda x: x[1].get(KEY_DATE, ""),
         reverse=True,
     )
 
 
 def find_game_by_position(pos: int) -> str | None:
-    """Находит appid по номеру позиции (начиная с 1)."""
     sorted_games = get_sorted_games()
     if 1 <= pos <= len(sorted_games):
         return sorted_games[pos - 1][0]
@@ -155,31 +300,14 @@ def find_game_by_position(pos: int) -> str | None:
 
 
 def find_game_by_name(name_part: str) -> str | None:
-    """Ищет appid по части названия (первое совпадение, без учёта регистра)."""
     name_lower = name_part.lower()
     for appid, info in games.items():
-        if name_lower in info.get("Название", "").lower():
+        if name_lower in info.get(KEY_NAME, "").lower():
             return appid
     return None
 
 
-# ── Таблица ─────────────────────────────────────────────────
-def build_short_table() -> str:
-    if not games:
-        return "📋 Список пока пуст."
-
-    sorted_games = get_sorted_games()
-    lines = ["<b>📋 Сравнение игр</b>\n"]
-    for idx, (appid, row) in enumerate(sorted_games, 1):
-        name = html.escape(row.get("Название", "?"))
-        price = html.escape(row.get("Цена", "?"))
-        link = row.get("Ссылка", f"https://store.steampowered.com/app/{appid}/")
-        lines.append(f'{idx}. <a href="{link}">{name}</a> — {price}')
-    lines.append(f"\nВсего игр: {len(games)}")
-    return "\n".join(lines)
-
-
-# ── Обработчики ────────────────────────────────────────────
+# ── Обработчики ──────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
     appids = set(re.findall(r"https?://store\.steampowered\.com/app/(\d+)", text))
@@ -192,17 +320,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if info is None:
             await update.message.reply_text(f"❌ Не удалось найти данные об игре {appid}")
             continue
+        # Сохраняем только короткие ключи
         games[appid] = {
-            "Дата": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "Название": info["name"],
-            "Цена": info["price"],
-            "Жанры": info["genres"],
-            "Ссылка": info["link"],
+            KEY_DATE: datetime.now().strftime("%Y-%m-%d %H:%M"),
+            KEY_NAME: info["name"],
+            KEY_PRICE: info["price"],
         }
         new_games += 1
 
     if new_games:
-        await save_to_pinned(context)
+        await save_data(context)
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
             f"Посмотреть: /show"
@@ -218,12 +345,6 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Удаление игры:
-    /delete 1          – по номеру из списка
-    /delete Hollow     – по части названия
-    /delete 730        – по appid
-    /delete <ссылка>   – по ссылке
-    """
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -234,40 +355,32 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     target = args[0]
     appid_to_delete = None
 
-    # 1. Пробуем как номер позиции (если строка состоит только из цифр и <= кол-ва игр)
     if target.isdigit():
         pos = int(target)
         if pos > 0 and pos <= len(games):
             appid_to_delete = find_game_by_position(pos)
-        if not appid_to_delete:
-            # Не номер позиции – пробуем как appid
-            if target in games:
-                appid_to_delete = target
+        if not appid_to_delete and target in games:
+            appid_to_delete = target
 
     if not appid_to_delete:
-        # 2. Ищем ссылку (вдруг скопировали ссылку целиком)
         match = re.search(r"/app/(\d+)", target)
-        if match:
-            potential_appid = match.group(1)
-            if potential_appid in games:
-                appid_to_delete = potential_appid
+        if match and match.group(1) in games:
+            appid_to_delete = match.group(1)
 
     if not appid_to_delete:
-        # 3. Поиск по названию
         appid_to_delete = find_game_by_name(target)
 
     if not appid_to_delete:
         await update.message.reply_text("❌ Игра не найдена. Проверьте номер, название или appid.")
         return
 
-    name = games[appid_to_delete].get("Название", appid_to_delete)
+    name = games[appid_to_delete].get(KEY_NAME, appid_to_delete)
     del games[appid_to_delete]
-    await save_to_pinned(context)
+    await save_data(context)
     await update.message.reply_text(f"🗑 Игра «{name}» удалена. Всего в списке: {len(games)}")
 
 
 async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Очистка всего списка с подтверждением."""
     args = context.args
     if not args or args[0].lower() not in ("yes", "да"):
         await update.message.reply_text("Для очистки списка введите /clear yes")
@@ -275,13 +388,13 @@ async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     count = len(games)
     games.clear()
-    await save_to_pinned(context)
+    await save_data(context)
     await update.message.reply_text(f"✅ Список очищен (удалено {count} игр)")
 
 
-# ── Запуск ─────────────────────────────────────────────────
+# ── Запуск ───────────────────────────────────────────────
 def main() -> None:
-    app = Application.builder().token(TOKEN).post_init(restore_from_pinned).build()
+    app = Application.builder().token(TOKEN).post_init(restore_data).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("show", show_table))
