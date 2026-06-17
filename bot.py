@@ -46,7 +46,7 @@ def load_all_data() -> dict[str, dict[str, dict]]:
         data = resp.json()
         if data.get("ok") and data["result"]["messages"]:
             msg = data["result"]["messages"][0]
-            storage_msg_id = msg["message_id"]          # запоминаем ID последнего сообщения
+            storage_msg_id = msg["message_id"]
             text = msg.get("text", "{}")
             return json.loads(text)
     except Exception as exc:
@@ -59,7 +59,7 @@ def save_all_data() -> None:
     text = json.dumps(all_games, ensure_ascii=False, separators=(',', ':'))
     try:
         if storage_msg_id:
-            # Пробуем отредактировать известное сообщение
+            # Пробуем редактировать существующее
             resp = requests.post(
                 f"{API_URL}/editMessageText",
                 json={
@@ -69,17 +69,15 @@ def save_all_data() -> None:
                 },
                 timeout=10,
             )
-            if resp.json().get("ok"):
+            result = resp.json()
+            if result.get("ok"):
+                logger.debug("Сообщение в хранилище отредактировано (id=%d)", storage_msg_id)
                 return
-            # Если не удалось отредактировать (устарело, удалено) – удаляем его и создаём новое
-            requests.post(
-                f"{API_URL}/deleteMessage",
-                json={"chat_id": STORAGE_CHAT_ID, "message_id": storage_msg_id},
-                timeout=5,
-            )
-            storage_msg_id = None
-
-        # Создаём новое сообщение и запоминаем его ID
+            else:
+                logger.warning("Ошибка редактирования хранилища: %s", result)
+                # Не удаляем старое сообщение, чтобы не потерять данные, если ошибка временная
+                # Просто создадим новое (старое останется, его можно удалить вручную при необходимости)
+        # Создаём новое сообщение
         resp = requests.post(
             f"{API_URL}/sendMessage",
             json={"chat_id": STORAGE_CHAT_ID, "text": text},
@@ -88,8 +86,11 @@ def save_all_data() -> None:
         data = resp.json()
         if data.get("ok"):
             storage_msg_id = data["result"]["message_id"]
+            logger.info("Создано новое сообщение в хранилище (id=%d)", storage_msg_id)
+        else:
+            logger.error("Не удалось отправить сообщение в хранилище: %s", data)
     except Exception as exc:
-        logger.error("Ошибка сохранения в хранилище: %s", exc)
+        logger.error("Исключение при сохранении: %s", exc)
 
 
 # ═══════════════ Таблица для конкретного чата ═════════════
@@ -258,9 +259,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         new_games += 1
 
     if new_games:
-        save_all_data()
-        update_prices_for_chat(games)
-        save_all_data()
+        save_all_data()                              # сначала сохраняем новый список
+        prices_changed = update_prices_for_chat(games)  # обновляем цены
+        if prices_changed:
+            save_all_data()                          # если цены изменились – сохраняем ещё раз
         await update_pinned_if_exists(chat_id, context)
         await update.message.reply_text(
             f"✅ Игры добавлены. Всего в списке: {len(games)}"
