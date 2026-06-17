@@ -126,7 +126,7 @@ def get_steam_data(appid: str) -> dict | None:
             else:
                 price = "Нет цены"
 
-            # Режимы и лимиты
+            # Режимы – только мультиплеер и его лимит (id 1-8)
             categories = g.get("categories", [])
             player_limit = None
             has_multi = False
@@ -135,37 +135,42 @@ def get_steam_data(appid: str) -> dict | None:
             for cat in categories:
                 cat_id = cat.get("id", 0)
                 # Мультиплеерные категории
-                if cat_id in (1, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48):
+                if cat_id == 1:
                     has_multi = True
-                elif cat_id == 49 or cat_id == 9:
-                    has_coop = True
-
-                # Лимиты игроков
-                if cat_id == 2:
+                elif cat_id == 2:
+                    has_multi = True
                     player_limit = 2
                 elif cat_id == 3:
+                    has_multi = True
                     player_limit = 4
                 elif cat_id == 4:
+                    has_multi = True
                     player_limit = 6
                 elif cat_id == 5:
+                    has_multi = True
                     player_limit = 8
                 elif cat_id == 6:
+                    has_multi = True
                     player_limit = 12
                 elif cat_id == 7:
+                    has_multi = True
                     player_limit = 16
                 elif cat_id == 8:
+                    has_multi = True
                     player_limit = 24
+                elif cat_id == 9 or cat_id == 49:
+                    has_coop = True
 
-            # Формируем короткую метку для /show
+            # Короткая метка для /show
             if has_multi:
                 if player_limit:
                     short_mode = f"до {player_limit}👥"
                 else:
                     short_mode = "👥"
             else:
-                short_mode = "1👤"   # <-- ИСПРАВЛЕНО
+                short_mode = "1👤"
 
-            # Текстовое описание для ответа при добавлении
+            # Описание для сообщения о добавлении
             desc_parts = []
             if has_multi:
                 if player_limit:
@@ -203,8 +208,10 @@ def build_short_table() -> str:
         name = html.escape(row.get(KEY_NAME, row.get("Название", "?")))
         price = html.escape(row.get(KEY_PRICE, row.get("Цена", "?")))
         link = f"https://store.steampowered.com/app/{appid}/"
-        mode_str = row.get(KEY_MODES, "1👤")   # <-- ИСПРАВЛЕНО
-        lines.append(f'{idx}. <a href="{link}">{name}</a> — {price} {mode_str}')
+        mode_str = row.get(KEY_MODES, "1👤")
+        # Название и цена в одной строке, режим на следующей с отступом
+        lines.append(f'{idx}. <a href="{link}">{name}</a> — {price}')
+        lines.append(f"   {mode_str}")
     lines.append(f"\nВсего игр: {len(games)}")
     return "\n".join(lines)
 
@@ -250,7 +257,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             KEY_DATE: datetime.now().strftime("%Y-%m-%d %H:%M"),
             KEY_NAME: info["name"],
             KEY_PRICE: info["price"],
-            KEY_MODES: info.get("short_mode", "1👤"),   # <-- ИСПРАВЛЕНО
+            KEY_MODES: info.get("short_mode", "1👤"),
         }
         new_games += 1
 
