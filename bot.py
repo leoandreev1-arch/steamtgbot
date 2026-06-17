@@ -25,11 +25,11 @@ API_URL = f"https://api.telegram.org/bot{TOKEN}"
 games: dict[str, dict] = {}
 pinned_msg_id: int | None = None
 
-# Короткие ключи для экономии места
 KEY_DATE = "д"
 KEY_NAME = "н"
 KEY_PRICE = "ц"
-ESTIMATED_BYTES_PER_GAME = 150
+KEY_MODES = "р"
+ESTIMATED_BYTES_PER_GAME = 200
 
 
 # ── Восстановление из закрепа ──────────────────────────────
@@ -126,7 +126,63 @@ def get_steam_data(appid: str) -> dict | None:
             else:
                 price = "Нет цены"
 
-            return {"name": name, "price": price}
+            # Режимы и лимиты
+            categories = g.get("categories", [])
+            player_limit = None
+            has_multi = False
+            has_coop = False
+
+            for cat in categories:
+                cat_id = cat.get("id", 0)
+                # Мультиплеерные категории
+                if cat_id in (1, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48):
+                    has_multi = True
+                elif cat_id == 49 or cat_id == 9:
+                    has_coop = True
+
+                # Лимиты игроков
+                if cat_id == 2:
+                    player_limit = 2
+                elif cat_id == 3:
+                    player_limit = 4
+                elif cat_id == 4:
+                    player_limit = 6
+                elif cat_id == 5:
+                    player_limit = 8
+                elif cat_id == 6:
+                    player_limit = 12
+                elif cat_id == 7:
+                    player_limit = 16
+                elif cat_id == 8:
+                    player_limit = 24
+
+            # Формируем короткую метку для /show
+            if has_multi:
+                if player_limit:
+                    short_mode = f"до {player_limit}👥"
+                else:
+                    short_mode = "👥"
+            else:
+                short_mode = "1👤"   # <-- ИСПРАВЛЕНО
+
+            # Текстовое описание для ответа при добавлении
+            desc_parts = []
+            if has_multi:
+                if player_limit:
+                    desc_parts.append(f"Мультиплеер (до {player_limit} игроков)")
+                else:
+                    desc_parts.append("Мультиплеер")
+            if has_coop:
+                desc_parts.append("Кооператив")
+            if not desc_parts:
+                desc_parts.append("Одиночная")
+
+            return {
+                "name": name,
+                "price": price,
+                "short_mode": short_mode,
+                "desc_mode": ", ".join(desc_parts),
+            }
         except Exception:
             continue
     return None
@@ -147,7 +203,8 @@ def build_short_table() -> str:
         name = html.escape(row.get(KEY_NAME, row.get("Название", "?")))
         price = html.escape(row.get(KEY_PRICE, row.get("Цена", "?")))
         link = f"https://store.steampowered.com/app/{appid}/"
-        lines.append(f'{idx}. <a href="{link}">{name}</a> — {price}')
+        mode_str = row.get(KEY_MODES, "1👤")   # <-- ИСПРАВЛЕНО
+        lines.append(f'{idx}. <a href="{link}">{name}</a> — {price} {mode_str}')
     lines.append(f"\nВсего игр: {len(games)}")
     return "\n".join(lines)
 
@@ -193,13 +250,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             KEY_DATE: datetime.now().strftime("%Y-%m-%d %H:%M"),
             KEY_NAME: info["name"],
             KEY_PRICE: info["price"],
+            KEY_MODES: info.get("short_mode", "1👤"),   # <-- ИСПРАВЛЕНО
         }
         new_games += 1
+
+        await update.message.reply_text(
+            f"✅ Игра добавлена\n"
+            f"🎮 {info['name']}\n"
+            f"💰 Цена: {info['price']}\n"
+            f"👥 {info.get('desc_mode', 'Одиночная')}",
+        )
 
     if new_games:
         await save_to_pinned(context)
         await update.message.reply_text(
-            f"✅ Игры добавлены. Всего в списке: {len(games)}\n"
+            f"Всего в списке: {len(games)}\n"
             f"Посмотреть: /show"
         )
 
@@ -215,7 +280,7 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def show_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     total_games = len(games)
     if total_games == 0:
-        await update.message.reply_text("📋 Список пуст. Лимит: ~26 игр в одном закреплённом сообщении.")
+        await update.message.reply_text("📋 Список пуст.")
         return
 
     sample_json = json.dumps(games, ensure_ascii=False)
