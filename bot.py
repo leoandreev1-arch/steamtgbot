@@ -20,11 +20,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TOKEN"]
-GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # ID твоей группы
+STORAGE_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])   # Это ID канала-хранилища (где лежит JSON)
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 games: dict[str, dict] = {}           # единый список игр
-pinned_msg_id: int | None = None      # ID закреплённого сообщения (JSON)
+storage_msg_id: int | None = None     # ID сообщения с JSON в канале-хранилище
 
 KEY_DATE = "д"
 KEY_NAME = "н"
@@ -33,60 +33,54 @@ ESTIMATED_BYTES_PER_GAME = 150
 STEAM_DELAY = 2
 
 
-# ═══════════════ Восстановление и сохранение в закреп ═════════════════
-def load_games_from_pinned() -> dict[str, dict]:
-    global pinned_msg_id
+# ═══════════════ Работа с хранилищем (канал) ═════════════════
+def load_games_from_storage() -> dict[str, dict]:
+    global storage_msg_id
     try:
         resp = requests.get(
-            f"{API_URL}/getChat",
-            params={"chat_id": GROUP_CHAT_ID},
+            f"{API_URL}/getChatHistory",
+            params={"chat_id": STORAGE_CHAT_ID, "limit": 1},
             timeout=10,
         )
         data = resp.json()
-        if data.get("ok"):
-            pinned = data["result"].get("pinned_message")
-            if pinned and "text" in pinned:
-                pinned_msg_id = pinned["message_id"]
-                return json.loads(pinned["text"])
+        if data.get("ok") and data["result"]["messages"]:
+            msg = data["result"]["messages"][0]
+            storage_msg_id = msg["message_id"]
+            text = msg.get("text", "{}")
+            return json.loads(text)
     except Exception as exc:
-        logger.warning("Ошибка загрузки из закрепа: %s", exc)
+        logger.warning("Ошибка загрузки из хранилища: %s", exc)
     return {}
 
 
-def save_games_to_pinned() -> None:
-    global pinned_msg_id
+def save_games_to_storage() -> None:
+    global storage_msg_id
     text = json.dumps(games, ensure_ascii=False, separators=(',', ':'))
     try:
-        if pinned_msg_id:
+        if storage_msg_id:
             resp = requests.post(
                 f"{API_URL}/editMessageText",
                 json={
-                    "chat_id": GROUP_CHAT_ID,
-                    "message_id": pinned_msg_id,
+                    "chat_id": STORAGE_CHAT_ID,
+                    "message_id": storage_msg_id,
                     "text": text,
                 },
                 timeout=10,
             )
             if resp.json().get("ok"):
                 return
-            pinned_msg_id = None
+            storage_msg_id = None
 
         resp = requests.post(
             f"{API_URL}/sendMessage",
-            json={"chat_id": GROUP_CHAT_ID, "text": text},
+            json={"chat_id": STORAGE_CHAT_ID, "text": text},
             timeout=10,
         )
         data = resp.json()
         if data.get("ok"):
-            new_id = data["result"]["message_id"]
-            requests.post(
-                f"{API_URL}/pinChatMessage",
-                json={"chat_id": GROUP_CHAT_ID, "message_id": new_id},
-                timeout=10,
-            )
-            pinned_msg_id = new_id
+            storage_msg_id = data["result"]["message_id"]
     except Exception as exc:
-        logger.error("Ошибка сохранения в закреп: %s", exc)
+        logger.error("Ошибка сохранения в хранилище: %s", exc)
 
 
 # ═══════════════ Реакция 👌 ══════════════════════════════
@@ -226,10 +220,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         new_games += 1
 
     if new_games:
-        save_games_to_pinned()
+        save_games_to_storage()
         prices_changed = update_prices_for_all()
         if prices_changed:
-            save_games_to_pinned()
+            save_games_to_storage()
         set_reaction(chat_id, message_id, "👌")
 
 
@@ -243,25 +237,25 @@ async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def pin_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Всегда создаёт новое сообщение с таблицей и закрепляет его.
-    Старый закреп (JSON или таблицу) открепляет.
+    Создаёт новое сообщение с таблицей и закрепляет его
+    в том чате, где была вызвана команда.
+    Старый закреп (если был) открепляется.
     """
+    chat_id = update.effective_chat.id          # чат, в котором написана команда
     table = build_short_table()
     try:
         # Отправляем новое сообщение
         msg = await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
+            chat_id=chat_id,                    # теперь правильный чат
             text=table,
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
         # Закрепляем его
         await msg.pin()
-        pinned_msg_id = msg.message_id   # обновляем ID закреплённого сообщения
-
         # Пробуем открепить предыдущее закреплённое сообщение (если было)
         try:
-            await context.bot.unpin_chat_message(chat_id=GROUP_CHAT_ID)
+            await context.bot.unpin_chat_message(chat_id=chat_id)
         except Exception:
             pass  # ничего страшного, если не получилось
 
@@ -321,7 +315,7 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     name = games[appid_to_delete].get(KEY_NAME, appid_to_delete)
     del games[appid_to_delete]
-    save_games_to_pinned()
+    save_games_to_storage()
     await update.message.reply_text(f"🗑 Игра «{name}» удалена. Всего в списке: {len(games)}")
 
 
@@ -333,15 +327,15 @@ async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     count = len(games)
     games.clear()
-    save_games_to_pinned()
+    save_games_to_storage()
     await update.message.reply_text(f"✅ Список очищен (удалено {count} игр)")
 
 
 # ═══════════════ Запуск ══════════════════════════════════
 async def post_init(app: Application) -> None:
-    global games, pinned_msg_id
-    games = load_games_from_pinned()
-    logger.info("Загружено %d игр из закрепа", len(games))
+    global games, storage_msg_id
+    games = load_games_from_storage()
+    logger.info("Загружено %d игр из хранилища", len(games))
 
 
 def main() -> None:
